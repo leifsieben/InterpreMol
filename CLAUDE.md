@@ -1,14 +1,22 @@
-# What 
+# What
 
-This is meant to be an interpretable spin on the succesful MPNN based GNN architecture in cheminformatics. Models such as chemprop or MiniMol have proven to be very succesful, probably because graphs are natural (if incomplete) representations of molecules. A major downside is that these models are generally poorly interpretable which is particularly key when used in structure-activity relationship (SAR) landscapes, where interpretable predictions could guide a chemists decision as to what molecules to test next. 
+This is meant to be an interpretable spin on the succesful MPNN based GNN architecture in cheminformatics. Models such as chemprop or MiniMol have proven to be very succesful, probably because graphs are natural (if incomplete) representations of molecules. A major downside is that these models are generally poorly interpretable which is particularly key when used in structure-activity relationship (SAR) landscapes, where interpretable predictions could guide a chemists decision as to what molecules to test next.
 
 ## Interpretability Approach: Integrated Gradients
 
-Integrated gradients (Sundararajan et al., ICML, 2023) is a method for attributing a deep neural network’s prediction to its input features. The core idea is to integrate the gradients of the output taken along a linear path from a baseline input to the input at hand, see Eq. (3). Mathematically, for a neural network F(x), an input x and baseline input  (e.g. the zero input), the attribution for the ith feature is:
+Integrated gradients (Sundararajan et al., ICML, 2017) is a method for attributing a deep neural network's prediction to its input features. The core idea is to integrate the gradients of the output taken along a linear path from a baseline input to the input at hand. Mathematically, for a neural network F(x), an input x and baseline input x' (e.g. the zero input), the attribution for the ith feature is:
 
-{{\rm{IntegratedGrads}}}_{i}(x)=\left({x}_{i}-{x}_{i}^{{\prime} }\right)\times \mathop{\int}\nolimits_{0}^{1}\frac{\partial F\left({x}^{{\prime} }+\alpha \times \left(x-{x}^{{\prime} }\right)\right)}{\partial {x}_{i}}\,{\rm{d}}\alpha .
+IntegratedGrads_i(x) = (x_i - x'_i) × ∫₀¹ (∂F(x' + α(x - x')) / ∂x_i) dα
 
-The method satisfies important axioms like sensitivity (if inputs differ in one feature but have different predictions, that feature should receive attribution) and implementation invariance (attributions are identical for functionally equivalent networks). The method is readily available for Hugging Face Transformer models through the transformers-interpret package (https://github.com/cdpierse/transformers-interpret). 
+The method satisfies important axioms like sensitivity (if inputs differ in one feature but have different predictions, that feature should receive attribution) and implementation invariance (attributions are identical for functionally equivalent networks).
+
+### Reference Baseline for SAR
+
+We extend the standard zero baseline with **MCS-guided reference baselines**:
+- Compare an analog to a hit structure using MCS (Maximum Common Substructure) alignment
+- Matched atoms: attributed against their hit counterpart → shows context change
+- New atoms: attributed against zero → shows full impact
+- This directly answers "what makes this analog different from the hit?"
 
 # Why
 
@@ -16,9 +24,45 @@ The long-term (ideal version) goal of this model would be a pre-trained, transfo
 
 # How
 
-* Keep the codebase as simple as possible. Use as many standard, well-maintained, common packages (transformers, pytorch, scipy, etc) as possible. 
+* Keep the codebase as simple as possible. Use as many standard, well-maintained, common packages (transformers, pytorch, scipy, etc) as possible.
 * Always keep in mind how these models get deployed in the end: They will pre-train on very large, supervised datasets (including hyperparameter optimization) which have multiple labels. Multi-task learning would be ideal where we train end-to-end including the prediction heads (a separate one for each task), these get deleted after pre-training and we only keep the shared parameters lower down. In general, we will use the same datasets as the pre-trained GNN MiniMol and wherever unclear we will make the same architectural decisions (https://github.com/graphcore-research/minimol, https://arxiv.org/pdf/2404.14986).
-* Then the models get pre-trained on some (presumably smaller) dataset and is then tasked with outputting a binary prediction (between 0 and 1) as to how active a given molecule will be. 
-* Ultimately the model should be light-weight, fast, and easy to interface. 
-* Assume that all molecules will be inputted as SMILES. For now, we don't need to support other formats. Do check whether a SMILES is valid and we will have to do graph construction as well. 
-* Make sure there is way to preconstruct all graphs of a dataset beforehand. Otherwise, each time we will have to reconstruct the same graphs from the SMILES of the molecules even though we could have reused this. Essentially like a pre-tokenized dataset. 
+* Then the models get fine-tuned on some (presumably smaller) dataset and is then tasked with outputting a binary prediction (between 0 and 1) as to how active a given molecule will be.
+* Ultimately the model should be light-weight, fast, and easy to interface.
+* Assume that all molecules will be inputted as SMILES. For now, we don't need to support other formats. Do check whether a SMILES is valid and we will have to do graph construction as well.
+* Make sure there is way to preconstruct all graphs of a dataset beforehand. Otherwise, each time we will have to reconstruct the same graphs from the SMILES of the molecules even though we could have reused this. Essentially like a pre-tokenized dataset.
+
+# Pretraining Data
+
+**Source file:** `datasets/all_datasets_fused_standardized.parquet`
+
+This is the master pretraining dataset containing:
+- ~1.5M molecules
+- ~3,288 tasks (assay endpoints)
+- SMILES column: `SMILES_std` (standardized)
+- Wide format with NaN for missing labels
+
+Use this dataset for all pretraining runs. The multi-task data loader handles missing labels via masked loss.
+
+# Current Implementation Status
+
+## Completed
+
+- [x] Edge-biased attention (Graphormer-style) with bond type and distance encoding
+- [x] Atom featurization with bond context
+- [x] Multi-task data loader with masked loss for missing labels
+- [x] Support for CSV and Parquet data files
+- [x] Integrated Gradients interpretability with MCS-based reference baseline
+- [x] `interpret_comparison(hit, analog)` for SAR analysis
+- [x] Hyperparameter optimization with Ray Tune
+- [x] Model save/load
+- [x] Unit tests
+
+## TODO
+
+- [ ] Pretrain on `all_datasets_fused_standardized.parquet`
+- [ ] Graph caching / pre-tokenization for faster data loading
+- [ ] Fine-tuning workflow (load pretrained weights, swap head)
+- [ ] Learning rate scheduler (cosine annealing)
+- [ ] Gradient accumulation for large effective batch sizes
+- [ ] Mixed precision training (fp16/bf16)
+- [ ] Distributed training support

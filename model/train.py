@@ -237,12 +237,30 @@ def get_dataloaders_multitask(config):
         val_ds = MultiTaskMoleculeDataset(
             config["val_df"], smiles_col=smiles_col, label_cols=label_cols
         )
+    elif "train_file" in config and "val_file" in config:
+        # Auto-detect CSV or Parquet
+        train_ds = MultiTaskMoleculeDataset.from_file(
+            config["train_file"], smiles_col=smiles_col, label_cols=label_cols
+        )
+        val_ds = MultiTaskMoleculeDataset.from_file(
+            config["val_file"], smiles_col=smiles_col, label_cols=label_cols
+        )
     elif "train_csv" in config and "val_csv" in config:
         train_ds = MultiTaskMoleculeDataset.from_csv(
             config["train_csv"], smiles_col=smiles_col, label_cols=label_cols
         )
         val_ds = MultiTaskMoleculeDataset.from_csv(
             config["val_csv"], smiles_col=smiles_col, label_cols=label_cols
+        )
+    elif "data_file" in config:
+        # Single file with automatic train/val split
+        df = pd.read_parquet(config["data_file"]) if config["data_file"].endswith(".parquet") else pd.read_csv(config["data_file"])
+        train_ds, val_ds = MultiTaskMoleculeDataset.train_val_split(
+            df,
+            smiles_col=smiles_col,
+            label_cols=label_cols,
+            val_frac=config.get("val_frac", 0.2),
+            seed=config.get("seed", 42)
         )
     elif "df" in config:
         train_ds, val_ds = MultiTaskMoleculeDataset.train_val_split(
@@ -253,7 +271,7 @@ def get_dataloaders_multitask(config):
             seed=config.get("seed", 42)
         )
     else:
-        raise ValueError("Config must contain train_df/val_df, train_csv/val_csv, or df")
+        raise ValueError("Config must contain train_df/val_df, train_file/val_file, train_csv/val_csv, data_file, or df")
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
