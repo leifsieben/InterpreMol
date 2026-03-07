@@ -24,7 +24,8 @@ class StreamingMoleculeDataset(IterableDataset):
         smiles_col: str = "SMILES_std",
         label_cols: Optional[List[str]] = None,
         row_groups: Optional[List[int]] = None,
-        shuffle_buffer_size: int = 10000,
+        shuffle_buffer_size: int = 1000,
+        max_tasks: Optional[int] = None,
     ):
         """
         Args:
@@ -33,6 +34,7 @@ class StreamingMoleculeDataset(IterableDataset):
             label_cols: List of label columns (None = auto-detect)
             row_groups: Which row groups to read (for train/val split)
             shuffle_buffer_size: Size of shuffle buffer
+            max_tasks: Maximum number of tasks to load (for memory efficiency)
         """
         self.parquet_path = parquet_path
         self.smiles_col = smiles_col
@@ -52,6 +54,11 @@ class StreamingMoleculeDataset(IterableDataset):
             self.label_cols = [c for c in all_columns if 'smiles' not in c.lower()]
         else:
             self.label_cols = label_cols
+
+        # Limit tasks if requested (for memory efficiency)
+        if max_tasks is not None and len(self.label_cols) > max_tasks:
+            print(f"Limiting tasks from {len(self.label_cols)} to {max_tasks}")
+            self.label_cols = self.label_cols[:max_tasks]
 
         self.n_tasks = len(self.label_cols)
 
@@ -135,7 +142,9 @@ def create_streaming_dataloaders(
     label_cols: Optional[List[str]] = None,
     val_frac: float = 0.1,
     batch_size: int = 64,
-    num_workers: int = 4,
+    num_workers: int = 0,
+    max_tasks: Optional[int] = None,
+    shuffle_buffer_size: int = 1000,
 ):
     """
     Create train/val dataloaders that stream from parquet.
@@ -159,13 +168,15 @@ def create_streaming_dataloaders(
     train_ds = StreamingMoleculeDataset(
         parquet_path, smiles_col, label_cols,
         row_groups=train_rgs,
-        shuffle_buffer_size=10000
+        shuffle_buffer_size=shuffle_buffer_size,
+        max_tasks=max_tasks,
     )
 
     val_ds = StreamingMoleculeDataset(
         parquet_path, smiles_col, label_cols,
         row_groups=val_rgs,
-        shuffle_buffer_size=1000  # Less shuffling for val
+        shuffle_buffer_size=100,  # Less shuffling for val
+        max_tasks=max_tasks,
     )
 
     train_loader = DataLoader(

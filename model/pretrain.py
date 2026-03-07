@@ -129,7 +129,9 @@ def setup_data(config: Dict) -> tuple:
             label_cols=label_cols,
             val_frac=config["val_frac"],
             batch_size=config["batch_size"],
-            num_workers=config.get("num_workers", 4),
+            num_workers=config.get("num_workers", 0),
+            max_tasks=config.get("max_tasks"),
+            shuffle_buffer_size=config.get("shuffle_buffer_size", 1000),
         )
 
         config["n_tasks"] = n_tasks
@@ -519,6 +521,7 @@ def main():
     parser.add_argument("--s3-bucket", type=str, help="S3 bucket for checkpoints")
     parser.add_argument("--checkpoint-dir", type=str, help="Checkpoint directory")
     parser.add_argument("--no-streaming", action="store_true", help="Disable streaming for parquet")
+    parser.add_argument("--max-tasks", type=int, help="Maximum number of tasks (for memory efficiency)")
 
     args = parser.parse_args()
 
@@ -546,6 +549,8 @@ def main():
         config["checkpoint_dir"] = args.checkpoint_dir
     if args.no_streaming:
         config["streaming"] = False
+    if args.max_tasks:
+        config["max_tasks"] = args.max_tasks
 
     # Print config
     print("Configuration:")
