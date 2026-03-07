@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -73,6 +73,7 @@ def get_default_config() -> Dict[str, Any]:
         # Training
         "batch_size": 64,
         "grad_accum_steps": 1,
+        "max_oom_skips_per_epoch": 20,
         "lr": 1e-4,
         "weight_decay": 1e-5,
         "epochs": 100,
@@ -94,6 +95,8 @@ def get_default_config() -> Dict[str, Any]:
 
         # Device
         "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "num_workers": 0,
+        "pin_memory": True,
 
         # Logging
         "log_every": 100,  # batches
@@ -170,8 +173,8 @@ def setup_data(config: Dict) -> tuple:
         batch_size=config["batch_size"],
         shuffle=True,
         collate_fn=multitask_collate,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=config.get("num_workers", 0),
+        pin_memory=config.get("pin_memory", True),
         drop_last=True
     )
 
@@ -180,8 +183,8 @@ def setup_data(config: Dict) -> tuple:
         batch_size=config["batch_size"],
         shuffle=False,
         collate_fn=multitask_collate,
-        num_workers=4,
-        pin_memory=True
+        num_workers=config.get("num_workers", 0),
+        pin_memory=config.get("pin_memory", True)
     )
 
     config["n_tasks"] = train_ds.n_tasks
@@ -230,48 +233,87 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     total_samples = 0
-    grad_accum_steps = config["grad_accum_steps"]
+    grad_accum_steps = max(1, int(config["grad_accum_steps"]))
+    use_amp = bool(config.get("use_amp", False) and scaler is not None and str(device).startswith("cuda"))
+    max_oom_skips = int(config.get("max_oom_skips_per_epoch", 20))
+    accum_counter = 0
+    skipped_no_label = 0
+    skipped_oom = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+
+    def _optimizer_step():
+        has_grad = any(p.grad is not None for p in model.parameters())
+        if not has_grad:
+            return
+        if use_amp:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, (mols, labels, masks) in enumerate(pbar):
         labels = labels.to(device)
         masks = masks.to(device)
+        batch_samples = int(masks.sum().item())
 
-        # Forward pass with AMP
-        if config["use_amp"] and scaler is not None:
-            with autocast():
+        # Skip fully unlabeled microbatches: they produce no useful gradient.
+        if batch_samples == 0:
+            skipped_no_label += 1
+            continue
+
+        try:
+            if use_amp:
+                with torch.amp.autocast("cuda", enabled=True):
+                    preds = model(mols)
+                    loss = criterion(preds, labels, masks)
+                    loss = loss / grad_accum_steps
+
+                scaler.scale(loss).backward()
+            else:
                 preds = model(mols)
                 loss = criterion(preds, labels, masks)
                 loss = loss / grad_accum_steps
+                loss.backward()
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            skipped_oom += 1
+            optimizer.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if skipped_oom > max_oom_skips:
+                raise RuntimeError(
+                    f"Exceeded max OOM skips ({max_oom_skips}) in epoch {epoch + 1}. "
+                    "Lower batch size/model size or increase grad_accum_steps."
+                ) from exc
+            continue
 
-            scaler.scale(loss).backward()
+        accum_counter += 1
+        if accum_counter % grad_accum_steps == 0:
+            _optimizer_step()
 
-            if (batch_idx + 1) % grad_accum_steps == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-        else:
-            preds = model(mols)
-            loss = criterion(preds, labels, masks)
-            loss = loss / grad_accum_steps
-            loss.backward()
-
-            if (batch_idx + 1) % grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-        batch_samples = masks.sum().item()
         total_loss += loss.item() * grad_accum_steps * batch_samples
         total_samples += batch_samples
 
         if (batch_idx + 1) % config["log_every"] == 0:
             avg_loss = total_loss / max(total_samples, 1)
             pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+
+    # Flush tail gradients when number of microbatches isn't divisible by grad_accum_steps.
+    if accum_counter % grad_accum_steps != 0:
+        _optimizer_step()
+
+    if skipped_no_label > 0 or skipped_oom > 0:
+        print(
+            f"Epoch {epoch + 1}: skipped {skipped_no_label} empty-label batches "
+            f"and {skipped_oom} OOM batches"
+        )
 
     return total_loss / max(total_samples, 1)
 
@@ -293,8 +335,8 @@ def validate(
         labels = labels.to(device)
         masks = masks.to(device)
 
-        if config["use_amp"]:
-            with autocast():
+        if config["use_amp"] and str(device).startswith("cuda"):
+            with torch.amp.autocast("cuda", enabled=True):
                 preds = model(mols)
                 loss = criterion(preds, labels, masks)
         else:
@@ -355,7 +397,7 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         raise ValueError(f"Unknown loss: {config['loss']}")
 
     # Setup AMP
-    scaler = GradScaler() if config["use_amp"] and device == "cuda" else None
+    scaler = GradScaler("cuda") if config["use_amp"] and str(device).startswith("cuda") else None
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -460,6 +502,8 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
         **config,
         "lr": tune.loguniform(1e-5, 1e-3),
         "weight_decay": tune.loguniform(1e-6, 1e-2),
+        "batch_size": tune.choice([8, 16, 32, 64]),
+        "grad_accum_steps": tune.choice([1, 2, 4]),
         "d_model": tune.choice([128, 256, 512]),
         "n_layers": tune.choice([4, 6, 8]),
         "n_heads": tune.choice([4, 8, 16]),
@@ -488,7 +532,10 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
         config=search_space,
         num_samples=num_samples,
         scheduler=scheduler,
-        resources_per_trial={"cpu": 4, "gpu": 1},
+        resources_per_trial={
+            "cpu": int(config.get("trial_cpus", 4)),
+            "gpu": float(config.get("trial_gpus", 1)),
+        },
         local_dir=config["checkpoint_dir"],
         name="interpremol_hyperopt"
     )
@@ -531,15 +578,15 @@ def main():
     # Override with command line args
     if args.data_file:
         config["data_file"] = args.data_file
-    if args.batch_size:
+    if args.batch_size is not None:
         config["batch_size"] = args.batch_size
-    if args.gradient_accumulation:
+    if args.gradient_accumulation is not None:
         config["grad_accum_steps"] = args.gradient_accumulation
-    if args.num_workers:
+    if args.num_workers is not None:
         config["num_workers"] = args.num_workers
-    if args.epochs:
+    if args.epochs is not None:
         config["epochs"] = args.epochs
-    if args.lr:
+    if args.lr is not None:
         config["lr"] = args.lr
     if args.device:
         config["device"] = args.device

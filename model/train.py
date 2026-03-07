@@ -142,7 +142,8 @@ def masked_bce_loss(preds, labels, mask):
         Scalar loss (mean over valid entries)
     """
     if mask.sum() == 0:
-        return torch.tensor(0.0, device=preds.device, requires_grad=True)
+        # Keep loss attached to graph so AMP/GradScaler sees optimizer parameters.
+        return preds.sum() * 0.0
 
     # Replace NaN with 0 to avoid NaN in loss computation
     labels_clean = torch.where(mask, labels, torch.zeros_like(labels))
@@ -170,7 +171,8 @@ def masked_mse_loss(preds, labels, mask):
         Scalar loss (mean over valid entries)
     """
     if mask.sum() == 0:
-        return torch.tensor(0.0, device=preds.device, requires_grad=True)
+        # Keep loss attached to graph so AMP/GradScaler sees optimizer parameters.
+        return preds.sum() * 0.0
 
     # Replace NaN with 0
     labels_clean = torch.where(mask, labels, torch.zeros_like(labels))
