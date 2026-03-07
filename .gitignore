@@ -1,1 +1,7 @@
 /datasets
+/interpremol
+__pycache__/
+*.pyc
+*.pt
+*.pkl
+.ipynb_checkpoints/

@@ -19,7 +19,7 @@ base_config = {
     "loss": "bce",  # binary classification
     "batch_size": 32,
     "epochs": 100,  # epochs per trial
-    "device": "gpu",  # use GPU if available
+    "device": "cuda",  # use GPU if available
     "train_smiles": train_smiles,
     "train_labels": train_labels,
     "val_smiles": val_smiles,
@@ -31,17 +31,24 @@ base_config = {
 search_space = {
     # Optimizer hyperparameters
     "lr": tune.loguniform(1e-5, 1e-3),
-    "weight_decay": tune.uniform(1e-6, 1e-2),
-    
-    # Architecture hyperparameters
-    "d_model": tune.choice([64, 128, 256]),
-    "n_layers": tune.choice([2, 3, 4, 6]),
-    "n_heads": tune.choice([2, 4, 8]),
-    "dim_ff": tune.choice([128, 256, 512]),
-    "dropout": tune.uniform(0.0, 0.5),
-    "mlp_hidden_dim": tune.choice([128, 256, 512]),
-    "mlp_head_depth": tune.choice([1, 2, 3]),
-    
+    "weight_decay": tune.loguniform(1e-6, 1e-2),
+
+    # Architecture hyperparameters (expanded for larger models)
+    "d_model": tune.choice([128, 256, 512]),
+    "n_layers": tune.choice([4, 6, 8, 12]),
+    "n_heads": tune.choice([4, 8, 16]),
+    "dim_ff": tune.choice([256, 512, 1024]),
+    "dropout": tune.uniform(0.0, 0.4),
+    "mlp_hidden_dim": tune.choice([256, 512, 1024]),
+    "mlp_head_depth": tune.choice([2, 3, 4]),
+
+    # Edge bias hyperparameters
+    "use_edge_bias": tune.choice([True, False]),
+    "max_distance": tune.choice([4, 6, 8]),
+
+    # CLS token
+    "use_cls_token": True,
+
     # Include non-tunable parameters from base_config
     **base_config
 }
@@ -65,7 +72,7 @@ best_config["train_smiles"] = train_smiles
 best_config["train_labels"] = train_labels
 best_config["val_smiles"] = val_smiles
 best_config["val_labels"] = val_labels
-best_config["device"] = "gpu"  # change to "gpu" if desired
+best_config["device"] = "cuda"  # change to "cpu" if no GPU
 
 # Train final model using the best configuration
 final_model, best_loss = train_model(best_config)

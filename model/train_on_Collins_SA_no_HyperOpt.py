@@ -28,7 +28,7 @@ def main():
         "lr": 1e-4,                # A good starting learning rate
         "weight_decay": 1e-4,      # Moderate regularization
         "d_model": 128,            # Model dimensionality
-        "n_layers": 3,             # A modest number of transformer layers
+        "n_layers": 4,             # Number of transformer layers
         "n_heads": 4,              # Number of attention heads
         "dim_ff": 256,             # Feedforward network dimension
         "dropout": 0.1,            # Small dropout to avoid overfitting
@@ -36,14 +36,16 @@ def main():
         "mlp_head_depth": 2,       # Depth of MLP head
         "loss": "bce",             # Binary cross-entropy loss for binary classification
         "batch_size": 32,          # Batch size for training
-        "epochs": 50,             # Maximum epochs (early stopping will likely cut this short)
+        "epochs": 50,              # Maximum epochs (early stopping will likely cut this short)
         "device": "cuda",          # Change to "cpu" if GPU is unavailable
         "train_smiles": train_smiles,
         "train_labels": train_labels,
         "val_smiles": val_smiles,
         "val_labels": val_labels,
         "early_stopping_patience": 10,  # Stop early if no improvement in 10 epochs
-        "use_cls_token": True      # Whether to use a [CLS] token for the classifier model
+        "use_cls_token": True,     # Whether to use a [CLS] token for the classifier model
+        "use_edge_bias": True,     # Use edge-biased attention (bond types + distances)
+        "max_distance": 6,         # Maximum graph distance to encode
     }
  
     # Train the model with the given configuration and capture the logs

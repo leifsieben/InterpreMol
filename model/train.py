@@ -16,6 +16,8 @@ class MoleculeDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         mol = Chem.MolFromSmiles(self.smiles[idx])
+        if mol is None:
+            raise ValueError(f"Invalid SMILES at index {idx}: {self.smiles[idx]}")
         label = torch.tensor([self.labels[idx]], dtype=torch.float)
         return mol, label
 
@@ -65,6 +67,7 @@ def train_model(config):
     best_val_loss = float("inf")
     best_epoch = -1
     best_model_state = None
+    epochs_without_improvement = 0
 
     # Lists to track losses per epoch for logging
     train_losses = []
@@ -129,6 +132,13 @@ def train_model(config):
         "best_epoch": best_epoch
     }
     return model, best_val_loss, logs
+
+
+def trainable(config):
+    """Ray Tune compatible training function."""
+    from ray import tune
+    model, val_loss, _ = train_model(config)
+    tune.report(val_loss=val_loss)
 
 
 def predict(model, dataset, batch_size=32, device=None, classification=True):
