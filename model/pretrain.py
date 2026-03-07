@@ -511,11 +511,14 @@ def main():
     # Override config options from command line
     parser.add_argument("--data-file", type=str, help="Path to data file")
     parser.add_argument("--batch-size", type=int, help="Batch size")
+    parser.add_argument("--gradient-accumulation", type=int, help="Gradient accumulation steps")
+    parser.add_argument("--num-workers", type=int, help="Number of data loader workers")
     parser.add_argument("--epochs", type=int, help="Number of epochs")
     parser.add_argument("--lr", type=float, help="Learning rate")
     parser.add_argument("--device", type=str, help="Device (cuda/cpu)")
     parser.add_argument("--s3-bucket", type=str, help="S3 bucket for checkpoints")
     parser.add_argument("--checkpoint-dir", type=str, help="Checkpoint directory")
+    parser.add_argument("--no-streaming", action="store_true", help="Disable streaming for parquet")
 
     args = parser.parse_args()
 
@@ -527,6 +530,10 @@ def main():
         config["data_file"] = args.data_file
     if args.batch_size:
         config["batch_size"] = args.batch_size
+    if args.gradient_accumulation:
+        config["grad_accum_steps"] = args.gradient_accumulation
+    if args.num_workers:
+        config["num_workers"] = args.num_workers
     if args.epochs:
         config["epochs"] = args.epochs
     if args.lr:
@@ -537,6 +544,8 @@ def main():
         config["s3_bucket"] = args.s3_bucket
     if args.checkpoint_dir:
         config["checkpoint_dir"] = args.checkpoint_dir
+    if args.no_streaming:
+        config["streaming"] = False
 
     # Print config
     print("Configuration:")
