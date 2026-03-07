@@ -527,18 +527,28 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
         reduction_factor=2
     )
 
-    analysis = tune.run(
-        trainable,
-        config=search_space,
-        num_samples=num_samples,
-        scheduler=scheduler,
-        resources_per_trial={
+    run_kwargs = {
+        "run_or_experiment": trainable,
+        "config": search_space,
+        "num_samples": num_samples,
+        "scheduler": scheduler,
+        "resources_per_trial": {
             "cpu": int(config.get("trial_cpus", 4)),
             "gpu": float(config.get("trial_gpus", 1)),
         },
-        local_dir=config["checkpoint_dir"],
-        name="interpremol_hyperopt"
-    )
+        "name": "interpremol_hyperopt",
+        "storage_path": str(Path(config["checkpoint_dir"]).resolve()),
+    }
+
+    # Ray >= 2.9 uses storage_path, while older versions still expect local_dir.
+    try:
+        analysis = tune.run(**run_kwargs)
+    except TypeError as exc:
+        if "storage_path" not in str(exc):
+            raise
+        run_kwargs.pop("storage_path", None)
+        run_kwargs["local_dir"] = config["checkpoint_dir"]
+        analysis = tune.run(**run_kwargs)
 
     best_config = analysis.get_best_config(metric="val_loss", mode="min")
     print(f"Best config: {best_config}")
