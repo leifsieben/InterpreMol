@@ -48,6 +48,22 @@ from train import (
 from aws_utils import S3Manager, CheckpointManager, get_instance_metadata
 
 
+def resolve_project_path(path_str: str) -> str:
+    """Resolve a possibly-relative path against project root."""
+    path = Path(path_str).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    # pretrain.py lives in <project_root>/model/
+    project_root = Path(__file__).resolve().parent.parent
+    candidate = (project_root / path).resolve()
+    if candidate.exists():
+        return str(candidate)
+
+    # Fallback to current working directory resolution.
+    return str(path.resolve())
+
+
 def get_default_config() -> Dict[str, Any]:
     """Default configuration for pretraining."""
     return {
@@ -117,6 +133,7 @@ def load_config(config_path: Optional[str]) -> Dict[str, Any]:
 
 def setup_data(config: Dict) -> tuple:
     """Set up data loaders."""
+    config["data_file"] = resolve_project_path(config["data_file"])
     print(f"Loading data from {config['data_file']}...")
 
     smiles_col = config["smiles_col"]
@@ -608,6 +625,10 @@ def main():
         config["streaming"] = False
     if args.max_tasks:
         config["max_tasks"] = args.max_tasks
+
+    # Resolve important paths once so Ray workers get absolute paths.
+    config["data_file"] = resolve_project_path(config["data_file"])
+    config["checkpoint_dir"] = resolve_project_path(config["checkpoint_dir"])
 
     # Print config
     print("Configuration:")
