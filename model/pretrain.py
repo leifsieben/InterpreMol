@@ -116,18 +116,37 @@ def setup_data(config: Dict) -> tuple:
     """Set up data loaders."""
     print(f"Loading data from {config['data_file']}...")
 
-    # Load data
+    smiles_col = config["smiles_col"]
+    label_cols = config.get("label_cols")
+
+    # Use streaming for parquet files (memory efficient)
+    if config["data_file"].endswith(".parquet") and config.get("streaming", True):
+        from streaming_dataset import create_streaming_dataloaders
+
+        train_loader, val_loader, n_tasks = create_streaming_dataloaders(
+            config["data_file"],
+            smiles_col=smiles_col,
+            label_cols=label_cols,
+            val_frac=config["val_frac"],
+            batch_size=config["batch_size"],
+            num_workers=config.get("num_workers", 4),
+        )
+
+        config["n_tasks"] = n_tasks
+        config["out_dim"] = n_tasks
+
+        return train_loader, val_loader
+
+    # Non-streaming fallback (loads all into memory)
+    print("Using in-memory loading (set streaming=True for large files)")
+
     if config["data_file"].endswith(".parquet"):
         df = pd.read_parquet(config["data_file"])
     else:
         df = pd.read_csv(config["data_file"])
 
     # Filter label columns
-    smiles_col = config["smiles_col"]
-    if config["label_cols"]:
-        label_cols = config["label_cols"]
-    else:
-        # Auto-detect: all columns except SMILES-like columns
+    if label_cols is None:
         label_cols = [c for c in df.columns if "smiles" not in c.lower()]
 
     print(f"Found {len(df)} molecules, {len(label_cols)} tasks")
