@@ -517,14 +517,16 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
     # Define search space
     search_space = {
         **config,
+        # Keep trials within a stable region for single A10G GPUs.
+        "use_amp": False,
         "lr": tune.loguniform(1e-5, 1e-3),
         "weight_decay": tune.loguniform(1e-6, 1e-2),
-        "batch_size": tune.choice([8, 16, 32, 64]),
+        "batch_size": tune.choice([4, 8, 16]),
         "grad_accum_steps": tune.choice([1, 2, 4]),
-        "d_model": tune.choice([128, 256, 512]),
-        "n_layers": tune.choice([4, 6, 8]),
-        "n_heads": tune.choice([4, 8, 16]),
-        "dim_ff": tune.choice([256, 512, 1024]),
+        "d_model": tune.choice([128, 256]),
+        "n_layers": tune.choice([4, 6]),
+        "n_heads": tune.choice([4, 8]),
+        "dim_ff": tune.choice([256, 512]),
         "dropout": tune.uniform(0.0, 0.3),
         "mlp_hidden_dim": tune.choice([256, 512]),
         "mlp_head_depth": tune.choice([2, 3]),
