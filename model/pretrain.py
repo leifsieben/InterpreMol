@@ -546,7 +546,13 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
 
     def trainable(trial_config):
         results = train(trial_config)
-        tune.report(val_loss=results['best_val_loss'])
+        # Ray Tune API differs across versions:
+        # - newer versions expect a single metrics dict
+        # - older versions accept keyword arguments
+        try:
+            tune.report({"val_loss": results['best_val_loss']})
+        except TypeError:
+            tune.report(val_loss=results['best_val_loss'])
 
     max_t = int(config["epochs"])
     grace_period = min(10, max_t)
