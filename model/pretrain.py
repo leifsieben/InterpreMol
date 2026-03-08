@@ -119,6 +119,10 @@ def get_default_config() -> Dict[str, Any]:
         "log_every": 100,  # batches
         "max_train_batches_per_epoch": None,  # optional smoke-test limiter
         "max_val_batches": None,  # optional smoke-test limiter
+
+        # HPO scheduler
+        "hpo_grace_period": None,  # None -> min(10, epochs)
+        "hpo_reduction_factor": 2,
     }
 
 
@@ -555,14 +559,19 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
             tune.report(val_loss=results['best_val_loss'])
 
     max_t = int(config["epochs"])
-    grace_period = min(10, max_t)
+    grace_cfg = config.get("hpo_grace_period")
+    if grace_cfg is None:
+        grace_period = min(10, max_t)
+    else:
+        grace_period = max(1, min(int(grace_cfg), max_t))
+    reduction_factor = int(config.get("hpo_reduction_factor", 2))
 
     scheduler = ASHAScheduler(
         metric="val_loss",
         mode="min",
         max_t=max_t,
         grace_period=grace_period,
-        reduction_factor=2
+        reduction_factor=reduction_factor
     )
 
     run_kwargs = {
@@ -620,6 +629,8 @@ def main():
     parser.add_argument("--max-atoms", type=int, help="Skip molecules with more than this many atoms")
     parser.add_argument("--max-train-batches", type=int, help="Limit train batches per epoch (smoke test)")
     parser.add_argument("--max-val-batches", type=int, help="Limit val batches per epoch (smoke test)")
+    parser.add_argument("--hpo-grace-period", type=int, help="ASHA grace period for HPO")
+    parser.add_argument("--hpo-reduction-factor", type=int, help="ASHA reduction factor for HPO")
 
     args = parser.parse_args()
 
@@ -655,6 +666,10 @@ def main():
         config["max_train_batches_per_epoch"] = args.max_train_batches
     if args.max_val_batches is not None:
         config["max_val_batches"] = args.max_val_batches
+    if args.hpo_grace_period is not None:
+        config["hpo_grace_period"] = args.hpo_grace_period
+    if args.hpo_reduction_factor is not None:
+        config["hpo_reduction_factor"] = args.hpo_reduction_factor
 
     # Resolve important paths once so Ray workers get absolute paths.
     config["data_file"] = resolve_project_path(config["data_file"])
