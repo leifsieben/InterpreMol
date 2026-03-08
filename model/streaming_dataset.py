@@ -28,6 +28,7 @@ class StreamingMoleculeDataset(IterableDataset):
         row_groups: Optional[List[int]] = None,
         shuffle_buffer_size: int = 1000,
         max_tasks: Optional[int] = None,
+        max_atoms: Optional[int] = None,
         task_chunk_size: int = 200,  # Read columns in chunks of this size
     ):
         """
@@ -44,6 +45,7 @@ class StreamingMoleculeDataset(IterableDataset):
         self.smiles_col = smiles_col
         self.shuffle_buffer_size = shuffle_buffer_size
         self.task_chunk_size = task_chunk_size
+        self.max_atoms = max_atoms
 
         # Open parquet file to get metadata
         self.parquet_file = pq.ParquetFile(parquet_path)
@@ -139,6 +141,8 @@ class StreamingMoleculeDataset(IterableDataset):
 
         # Buffer for shuffling
         buffer = []
+        skipped_invalid = 0
+        skipped_large = 0
 
         for rg_idx in row_groups:
             # Read row group with chunked column reading
@@ -149,6 +153,10 @@ class StreamingMoleculeDataset(IterableDataset):
                 # Parse molecule
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None:
+                    skipped_invalid += 1
+                    continue
+                if self.max_atoms is not None and mol.GetNumAtoms() > self.max_atoms:
+                    skipped_large += 1
                     continue
 
                 # Add to buffer (store sparse labels)
@@ -169,6 +177,15 @@ class StreamingMoleculeDataset(IterableDataset):
             np.random.shuffle(buffer)
             for item in buffer:
                 yield item
+
+        if skipped_invalid or skipped_large:
+            worker_suffix = ""
+            if worker_info is not None:
+                worker_suffix = f" worker={worker_info.id}"
+            print(
+                f"StreamingDataset skipped invalid={skipped_invalid} "
+                f"too_large={skipped_large} max_atoms={self.max_atoms}{worker_suffix}"
+            )
 
 
 def streaming_collate(batch):
@@ -234,6 +251,7 @@ def create_streaming_dataloaders(
     batch_size: int = 64,
     num_workers: int = 0,
     max_tasks: Optional[int] = None,
+    max_atoms: Optional[int] = None,
     shuffle_buffer_size: int = 1000,
     task_chunk_size: int = 200,
 ):
@@ -261,6 +279,7 @@ def create_streaming_dataloaders(
         row_groups=train_rgs,
         shuffle_buffer_size=shuffle_buffer_size,
         max_tasks=max_tasks,
+        max_atoms=max_atoms,
         task_chunk_size=task_chunk_size,
     )
 
@@ -269,6 +288,7 @@ def create_streaming_dataloaders(
         row_groups=val_rgs,
         shuffle_buffer_size=100,  # Less shuffling for val
         max_tasks=max_tasks,
+        max_atoms=max_atoms,
         task_chunk_size=task_chunk_size,
     )
 

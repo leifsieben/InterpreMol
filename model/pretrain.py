@@ -85,6 +85,7 @@ def get_default_config() -> Dict[str, Any]:
         "use_cls_token": True,
         "use_edge_bias": True,
         "max_distance": 6,
+        "max_atoms": 192,
 
         # Training
         "batch_size": 64,
@@ -116,6 +117,8 @@ def get_default_config() -> Dict[str, Any]:
 
         # Logging
         "log_every": 100,  # batches
+        "max_train_batches_per_epoch": None,  # optional smoke-test limiter
+        "max_val_batches": None,  # optional smoke-test limiter
     }
 
 
@@ -151,6 +154,7 @@ def setup_data(config: Dict) -> tuple:
             batch_size=config["batch_size"],
             num_workers=config.get("num_workers", 0),
             max_tasks=config.get("max_tasks"),
+            max_atoms=config.get("max_atoms"),
             shuffle_buffer_size=config.get("shuffle_buffer_size", 1000),
         )
 
@@ -259,6 +263,7 @@ def train_epoch(
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
     optimizer.zero_grad(set_to_none=True)
+    max_train_batches = config.get("max_train_batches_per_epoch")
 
     def _optimizer_step():
         has_grad = any(p.grad is not None for p in model.parameters())
@@ -275,6 +280,8 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, (mols, labels, masks) in enumerate(pbar):
+        if max_train_batches is not None and batch_idx >= int(max_train_batches):
+            break
         labels = labels.to(device)
         masks = masks.to(device)
         batch_samples = int(masks.sum().item())
@@ -347,8 +354,11 @@ def validate(
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    max_val_batches = config.get("max_val_batches")
 
-    for mols, labels, masks in tqdm(val_loader, desc="Validating"):
+    for batch_idx, (mols, labels, masks) in enumerate(tqdm(val_loader, desc="Validating")):
+        if max_val_batches is not None and batch_idx >= int(max_val_batches):
+            break
         labels = labels.to(device)
         masks = masks.to(device)
 
@@ -598,6 +608,9 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, help="Checkpoint directory")
     parser.add_argument("--no-streaming", action="store_true", help="Disable streaming for parquet")
     parser.add_argument("--max-tasks", type=int, help="Maximum number of tasks (for memory efficiency)")
+    parser.add_argument("--max-atoms", type=int, help="Skip molecules with more than this many atoms")
+    parser.add_argument("--max-train-batches", type=int, help="Limit train batches per epoch (smoke test)")
+    parser.add_argument("--max-val-batches", type=int, help="Limit val batches per epoch (smoke test)")
 
     args = parser.parse_args()
 
@@ -627,6 +640,12 @@ def main():
         config["streaming"] = False
     if args.max_tasks:
         config["max_tasks"] = args.max_tasks
+    if args.max_atoms is not None:
+        config["max_atoms"] = args.max_atoms
+    if args.max_train_batches is not None:
+        config["max_train_batches_per_epoch"] = args.max_train_batches
+    if args.max_val_batches is not None:
+        config["max_val_batches"] = args.max_val_batches
 
     # Resolve important paths once so Ray workers get absolute paths.
     config["data_file"] = resolve_project_path(config["data_file"])

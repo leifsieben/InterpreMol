@@ -6,6 +6,8 @@ from torch.nn.utils.rnn import pad_sequence
 from atom_embedding import AtomFeaturizer
 from edge_bias import EdgeBiasEncoder
 
+_ATTN_FALLBACK_WARNED = False
+
 class InterpreMol(nn.Module):
     def __init__(self, encoder, head, config):
         super().__init__()
@@ -175,6 +177,20 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
     Returns:
         attn_output: [batch, n_heads, seq_len, d_k]
     """
+    def _is_cublas_invalid(exc: RuntimeError) -> bool:
+        return "CUBLAS_STATUS_INVALID_VALUE" in str(exc)
+
+    def _loop_batched_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # a: [B, H, M, K], b: [B, H, K, N] -> [B, H, M, N]
+        batch, heads, m, k = a.shape
+        _, _, _, n = b.shape
+        a2 = a.reshape(batch * heads, m, k)
+        b2 = b.reshape(batch * heads, k, n)
+        out = torch.empty((batch * heads, m, n), device=a.device, dtype=a.dtype)
+        for i in range(batch * heads):
+            out[i] = torch.mm(a2[i], b2[i])
+        return out.view(batch, heads, m, n)
+
     d_k = Q.shape[-1]
     orig_dtype = Q.dtype
 
@@ -184,8 +200,33 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
     K = K.float().contiguous()
     V = V.float().contiguous()
 
+    if Q.shape[-1] == 0:
+        raise RuntimeError(f"Invalid attention head width d_k=0 for Q shape {tuple(Q.shape)}")
+    if not torch.isfinite(Q).all() or not torch.isfinite(K).all() or not torch.isfinite(V).all():
+        raise RuntimeError(
+            "Non-finite Q/K/V before attention matmul. "
+            f"Q finite={torch.isfinite(Q).all().item()} "
+            f"K finite={torch.isfinite(K).all().item()} "
+            f"V finite={torch.isfinite(V).all().item()} "
+            f"Q shape={tuple(Q.shape)}"
+        )
+
     # Compute attention scores: [batch, n_heads, seq, seq]
-    scores = torch.matmul(Q, K.transpose(-2, -1).contiguous()) / math.sqrt(d_k)
+    k_t = K.transpose(-2, -1).contiguous()
+    try:
+        scores = torch.matmul(Q, k_t)
+    except RuntimeError as exc:
+        if not _is_cublas_invalid(exc):
+            raise
+        global _ATTN_FALLBACK_WARNED
+        if not _ATTN_FALLBACK_WARNED:
+            print(
+                "[attention fallback] CUBLAS invalid in batched matmul; "
+                f"using per-head mm fallback. Q={tuple(Q.shape)} K={tuple(K.shape)}"
+            )
+            _ATTN_FALLBACK_WARNED = True
+        scores = _loop_batched_mm(Q, k_t)
+    scores = scores / math.sqrt(d_k)
 
     # Add edge bias BEFORE softmax
     if edge_bias is not None:
@@ -207,7 +248,13 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
         attn_weights = F.dropout(attn_weights, p=dropout_p)
 
     # Apply to values
-    attn_output = torch.matmul(attn_weights, V)
+    v_mat = V.contiguous()
+    try:
+        attn_output = torch.matmul(attn_weights, v_mat)
+    except RuntimeError as exc:
+        if not _is_cublas_invalid(exc):
+            raise
+        attn_output = _loop_batched_mm(attn_weights, v_mat)
 
     return attn_output.to(orig_dtype)
 
