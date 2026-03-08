@@ -548,11 +548,14 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
         results = train(trial_config)
         tune.report(val_loss=results['best_val_loss'])
 
+    max_t = int(config["epochs"])
+    grace_period = min(10, max_t)
+
     scheduler = ASHAScheduler(
         metric="val_loss",
         mode="min",
-        max_t=config["epochs"],
-        grace_period=10,
+        max_t=max_t,
+        grace_period=grace_period,
         reduction_factor=2
     )
 
