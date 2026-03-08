@@ -102,9 +102,13 @@ class AtomFeaturizer(nn.Module):
             # Embed scalar features (including normalized bond counts)
             scalar_feats = torch.tensor(
                 [is_aromatic, in_ring, mass] + [c / 4.0 for c in bond_counts],
-                dtype=torch.float, device=device
+                dtype=torch.float32, device=device
             )
-            emb = emb + self.scalar_proj(scalar_feats)
+            # Keep scalar projection in FP32 to avoid intermittent AMP/cuBLAS
+            # invalid-value failures on small GEMMs.
+            with torch.amp.autocast(device_type=device.type, enabled=False):
+                scalar_emb = self.scalar_proj(scalar_feats.float())
+            emb = emb + scalar_emb.to(dtype=emb.dtype)
 
             atom_features.append(emb)
 
