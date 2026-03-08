@@ -66,3 +66,16 @@ Use this dataset for all pretraining runs. The multi-task data loader handles mi
 - [ ] Gradient accumulation for large effective batch sizes
 - [ ] Mixed precision training (fp16/bf16)
 - [ ] Distributed training support
+
+# Infrastructure Constraints
+
+- For this project, never allocate more than **16 total EC2 vCPUs**.
+- Do not max out the account/project `G and VT` on-demand vCPU quota (32), because other projects run in parallel.
+
+## Active Host Lock (2026-03-08)
+
+- Use **only this EC2 instance** for current InterpreMol setup and runs:
+  - Instance ID: `i-0ed3ae87b8a3d1a20`
+  - Public IP: `3.220.174.83`
+  - Type: `g5.4xlarge` (1 GPU, 16 vCPU)
+- Do **not** SSH into or modify any other instance for this project until this lock is explicitly changed.
