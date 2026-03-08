@@ -176,9 +176,16 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
         attn_output: [batch, n_heads, seq_len, d_k]
     """
     d_k = Q.shape[-1]
+    orig_dtype = Q.dtype
+
+    # Use contiguous FP32 tensors for attention matmuls to avoid intermittent CUBLAS
+    # invalid-value failures with strided batched GEMM on some GPU/kernel combinations.
+    Q = Q.float().contiguous()
+    K = K.float().contiguous()
+    V = V.float().contiguous()
 
     # Compute attention scores: [batch, n_heads, seq, seq]
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+    scores = torch.matmul(Q, K.transpose(-2, -1).contiguous()) / math.sqrt(d_k)
 
     # Add edge bias BEFORE softmax
     if edge_bias is not None:
@@ -190,7 +197,7 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
     if key_padding_mask is not None:
         # key_padding_mask: [batch, seq] -> [batch, 1, 1, seq]
         mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-        scores = scores.masked_fill(mask, float('-inf'))
+        scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
 
     # Softmax
     attn_weights = F.softmax(scores, dim=-1)
@@ -202,7 +209,7 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
     # Apply to values
     attn_output = torch.matmul(attn_weights, V)
 
-    return attn_output
+    return attn_output.to(orig_dtype)
 
 
 class GraphTransformerBlock(nn.Module):
@@ -305,4 +312,3 @@ class MLPHead(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
-
