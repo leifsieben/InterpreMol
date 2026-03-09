@@ -177,6 +177,15 @@ InterpreMol/
 └── README.md
 ```
 
+## Methodology 
+
+### Hyperparameter Optimization 
+
+We performed hyperparameter optimization as a two-stage procedure designed to reduce wall-clock time while preserving a principled model-selection process. In Stage 1 (fast screening), we ran a reduced-cost search on a single GPU using a limited trial budget (num_samples=12) and a short training horizon, with early stopping enabled and aggressive ASHA-based pruning. The search was intentionally proxy-based: each trial was allowed only a small training budget and additional runtime caps were imposed during HPO only (max_tasks=256, max_train_batches_per_epoch=250, max_val_batches=40) so that clearly underperforming configurations could be discarded early. Pruning was made deliberately aggressive by reducing the scheduler grace period to hpo_grace_period=2 and using hpo_reduction_factor=3, so trials had to show useful signal within the first few epochs to survive. This stage therefore served as a ranking mechanism rather than a final estimate of best achievable performance. The search space was the project’s predefined HPO parameter space in the training code, with the scheduler controls patched to expose the pruning hyperparameters explicitly; Stage 1 evaluated draws from that space under the shortened budget and produced a ranked list of candidate configurations.
+
+In Stage 2 (refinement), we do not continue all Stage 1 trials. Instead, we take only the top 2–3 configurations from Stage 1, as ranked by the same validation objective used during HPO, and retrain them under fuller settings intended to better approximate final performance. Concretely, Stage 2 removes or relaxes the Stage 1 proxy caps and increases training fidelity by running longer (roughly 30–100 epochs) with less aggressive stopping (early_stopping_patience around 8–10). The decision rule from Stage 1 to Stage 2 is therefore: select the highest-ranked configurations under the Stage 1 validation metric, subject to keeping the finalist set small enough to make full retraining practical on 1 GPU. Operationally, the process was made repeatable by assigning each run a unique run ID, storing logs and heartbeat files, syncing artifacts to S3 on a schedule, and generating a stage2_template.json artifact that records how the finalist configurations should be instantiated for refinement. This gives a reproducible audit trail from initial screening through final candidate selection.
+If you want, I can turn this into a tighter paper-style “Hyperparameter Optimization” subsection with explicit placeholders for the exact parameter names from your search space.
+
 ## References
 
 - Integrated Gradients: Sundararajan et al., ICML 2017
