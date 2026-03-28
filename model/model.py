@@ -49,12 +49,20 @@ class InterpreMol(nn.Module):
         )
         encoder.load_state_dict(state["encoder"], strict=False)
 
-        head = MLPHead(
-            input_dim=config["d_model"],
-            hidden_dim=config["mlp_hidden_dim"],
-            depth=config["mlp_head_depth"],
-            out_dim=config.get("out_dim", 1)
-        )
+        if config.get("task_heads"):
+            head = MultiTaskHeads(
+                input_dim=config["d_model"],
+                hidden_dim=config["mlp_hidden_dim"],
+                depth=config["mlp_head_depth"],
+                task_heads=config["task_heads"],
+            )
+        else:
+            head = MLPHead(
+                input_dim=config["d_model"],
+                hidden_dim=config["mlp_hidden_dim"],
+                depth=config["mlp_head_depth"],
+                out_dim=config.get("out_dim", 1)
+            )
 
         head.load_state_dict(state["head"])
 
@@ -76,12 +84,20 @@ class InterpreMol(nn.Module):
             use_edge_bias=config.get("use_edge_bias", True),
             max_distance=config.get("max_distance", 6)
         )
-        head = MLPHead(
-            input_dim=config["d_model"],
-            hidden_dim=config["mlp_hidden_dim"],
-            depth=config["mlp_head_depth"],
-            out_dim=config.get("out_dim", 1)
-        )
+        if config.get("task_heads"):
+            head = MultiTaskHeads(
+                input_dim=config["d_model"],
+                hidden_dim=config["mlp_hidden_dim"],
+                depth=config["mlp_head_depth"],
+                task_heads=config["task_heads"],
+            )
+        else:
+            head = MLPHead(
+                input_dim=config["d_model"],
+                hidden_dim=config["mlp_hidden_dim"],
+                depth=config["mlp_head_depth"],
+                out_dim=config.get("out_dim", 1)
+            )
         return cls(encoder, head, config)
 
 
@@ -359,3 +375,43 @@ class MLPHead(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
+
+
+class MultiTaskHeads(nn.Module):
+    """
+    Separate prediction heads for typed task groups.
+
+    Expected config format:
+    {
+        "binary": {"out_dim": 1332},
+        "multiclass": {"out_dim": 1956, "num_classes": 3}
+    }
+    """
+
+    def __init__(self, input_dim, hidden_dim, depth, task_heads):
+        super().__init__()
+        self.task_heads = task_heads
+        self.heads = nn.ModuleDict()
+
+        for head_name, head_cfg in task_heads.items():
+            out_dim = int(head_cfg["out_dim"])
+            num_classes = int(head_cfg.get("num_classes", 1))
+            final_dim = out_dim if num_classes == 1 else out_dim * num_classes
+            self.heads[head_name] = MLPHead(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                out_dim=final_dim,
+            )
+
+    def forward(self, x):
+        outputs = {}
+        for head_name, head in self.heads.items():
+            logits = head(x)
+            head_cfg = self.task_heads[head_name]
+            num_classes = int(head_cfg.get("num_classes", 1))
+            out_dim = int(head_cfg["out_dim"])
+            if num_classes > 1:
+                logits = logits.view(x.shape[0], out_dim, num_classes)
+            outputs[head_name] = logits
+        return outputs

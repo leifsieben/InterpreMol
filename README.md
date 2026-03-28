@@ -177,14 +177,156 @@ InterpreMol/
 └── README.md
 ```
 
-## Methodology 
+## Methodology
 
-### Hyperparameter Optimization 
+### Phase 1: Valid Foundational Pretraining
 
-We performed hyperparameter optimization as a two-stage procedure designed to reduce wall-clock time while preserving a principled model-selection process. In Stage 1 (fast screening), we ran a reduced-cost search on a single GPU using a limited trial budget (num_samples=12) and a short training horizon, with early stopping enabled and aggressive ASHA-based pruning. The search was intentionally proxy-based: each trial was allowed only a small training budget and additional runtime caps were imposed during HPO only (max_tasks=256, max_train_batches_per_epoch=250, max_val_batches=40) so that clearly underperforming configurations could be discarded early. Pruning was made deliberately aggressive by reducing the scheduler grace period to hpo_grace_period=2 and using hpo_reduction_factor=3, so trials had to show useful signal within the first few epochs to survive. This stage therefore served as a ranking mechanism rather than a final estimate of best achievable performance. The search space was the project’s predefined HPO parameter space in the training code, with the scheduler controls patched to expose the pruning hyperparameters explicitly; Stage 1 evaluated draws from that space under the shortened budget and produced a ranked list of candidate configurations.
+The March 2026 pretraining run family should not be treated as authoritative. It demonstrated that the infrastructure runs, but the methodology was wrong for the fused table:
 
-In Stage 2 (refinement), we do not continue all Stage 1 trials. Instead, we take only the top 2–3 configurations from Stage 1, as ranked by the same validation objective used during HPO, and retrain them under fuller settings intended to better approximate final performance. Concretely, Stage 2 removes or relaxes the Stage 1 proxy caps and increases training fidelity by running longer (roughly 30–100 epochs) with less aggressive stopping (early_stopping_patience around 8–10). The decision rule from Stage 1 to Stage 2 is therefore: select the highest-ranked configurations under the Stage 1 validation metric, subject to keeping the finalist set small enough to make full retraining practical on 1 GPU. Operationally, the process was made repeatable by assigning each run a unique run ID, storing logs and heartbeat files, syncing artifacts to S3 on a schedule, and generating a stage2_template.json artifact that records how the finalist configurations should be instantiated for refinement. This gives a reproducible audit trail from initial screening through final candidate selection.
-If you want, I can turn this into a tighter paper-style “Hyperparameter Optimization” subsection with explicit placeholders for the exact parameter names from your search space.
+- the fused table is mixed-task, not purely binary
+- `Wong_fused` and `PCBA_1328` are binary
+- `L1000_MCF7` and `L1000_VCAP` are ternary with values `{0,1,2}`
+- the old Stage 1 HPO used `multitask-bce` anyway
+- the old Stage 1 HPO only searched the first `256` columns, which were `4 x Wong_fused + 252 x L1000_MCF7`
+- Ray Tune only received one final report per trial, so ASHA pruning was not doing the intended job
+
+The immediate goal is therefore Phase 1: produce one valid, fully trained foundational InterpreMol encoder from the fused supervised table.
+
+Phase 1 starts with a task audit artifact. Every pretraining run must be driven by a manifest rather than by blindly taking every non-SMILES column. The manifest should record, for every task:
+
+- task name
+- broad family and subfamily
+- task type
+- number of classes
+- valid label count
+- value range
+- class counts
+- inclusion flags for HPO and Stage 2
+
+The current expected family structure of `datasets/all_datasets_fused_standardized.parquet` is:
+
+- `Wong_fused`: `4` binary tasks
+- `PCBA_1328`: `1328` binary tasks
+- `L1000_MCF7`: `978` ternary tasks
+- `L1000_VCAP`: `978` ternary tasks
+
+Pretraining must then use typed heads and typed losses:
+
+- one binary multitask head for binary tasks with masked BCE-with-logits
+- one ternary multitask head for L1000 tasks with masked cross-entropy
+- a shared graph encoder underneath
+
+The composite training and validation objective should be an equal-weight average over broad families so that the largest family does not dominate model selection. The recommended broad-family weighting is:
+
+- `Wong_fused`
+- `PCBA_1328`
+- `L1000`, where `MCF7` and `VCAP` are averaged equally inside the family
+
+### Phase 1 HPO Plan
+
+The new HPO should still be two-stage, but actually defensible.
+
+Stage 0 is a short smoke run on the typed-task setup. Its purpose is only to verify:
+
+- manifest generation and loading
+- binary and ternary losses both behave correctly
+- no negative or non-finite losses occur
+- per-family metrics are logged
+- checkpoints and S3 backups work
+
+Stage 1 is the proxy HPO stage. This stage should use intermediate validation reports so ASHA can prune aggressively. It should search a slightly wider architecture space than before, while reducing freedom elsewhere:
+
+- `d_model`: `{192, 256, 384, 512}`
+- `n_layers`: `{4, 6, 8}`
+- `n_heads`: `8`
+- `dim_ff = 2 * d_model`
+- `mlp_hidden_dim = 2 * d_model`
+- `mlp_head_depth = 2`
+- `dropout`: search
+- `lr`: search
+- `weight_decay`: search
+- `grad_accum_steps`: search
+- `max_distance`: search
+- `use_edge_bias = true`
+- `use_cls_token = true`
+
+To keep this wider search tractable, the expensive corner of the space should be constrained:
+
+- if `d_model = 512`, only allow `n_layers in {4, 6}`
+- if `n_layers = 8`, cap `d_model <= 384`
+
+Stage 1 should remain aggressive:
+
+- sequential single-GPU trials on a larger single node
+- aggressive ASHA pruning based on repeated intermediate validation reports
+- only the rank-1 configuration is promoted
+
+Stage 2 is the actual foundational training run. It should retrain the single selected configuration on the full typed-task objective until convergence, preserving:
+
+- `best_model.pt`
+- latest checkpoint
+- encoder-only artifact
+- full config
+- task manifest
+- per-family metric history
+
+### Phase 2: MoleculeNet Benchmarking
+
+Phase 2 starts only after Phase 1 produces a valid finalized foundational checkpoint. The benchmark should then compare:
+
+- InterpreMol pretrained encoder with frozen encoder transfer
+- InterpreMol pretrained encoder with end-to-end fine-tuning
+- Chemprop v2 in its regular benchmark mode
+
+The benchmark scope should cover the common MoleculeNet classification and regression tasks using both random and scaffold splits, aggregated over `3` seeds. This comparison is best-effort rather than fully co-tuned: we will use documented and reasonable settings for both methods, but we will not run a full per-dataset hyperparameter search for each benchmark model.
+
+### Required Benchmark Outputs
+
+For every MoleculeNet benchmark run, we should save:
+
+- dataset name, split type, seed, and task type
+- exact training config for InterpreMol and Chemprop v2
+- pointer to the pretrained InterpreMol checkpoint used
+- per-run metrics on validation and test sets
+- per-molecule predictions on the test split
+- aggregated summary tables over seeds
+- generated plots
+
+At minimum, the plotting set should include:
+
+- per-dataset comparison bar plots for InterpreMol vs Chemprop v2
+- random-split vs scaffold-split comparison plots
+- seed-level variability plots or error bars
+- training-curve plots for representative runs
+- overall summary figure spanning all benchmark datasets
+
+### Interpretability Validation Plan
+
+After the benchmark pipeline is working, we need to verify that the integrated gradients interpretability workflow still behaves correctly with the final pretrained model and downstream fine-tuned models.
+
+This validation should happen in two stages:
+
+1. Technical validation
+   - confirm the interpretability code still runs on the finalized model checkpoints
+   - verify that attributions are stable enough across repeated runs and sensible baselines
+   - confirm that atom-level attribution outputs align with the current model interface after pretraining and fine-tuning
+2. Chemical sanity checking
+   - work through real molecular examples rather than only synthetic smoke tests
+   - compare attributed substructures with expected SAR-relevant motifs
+   - identify cases where the explanation is chemically plausible and cases where it is not
+   - capture representative successful and failure-case examples for later figures and discussion
+
+## Action Items
+
+1. Finalize Stage 2 training and preserve the selected pretrained model artifacts.
+2. Create a reproducibility bundle containing the selected config, weights, checkpoints, logs, code revision, dataset identity, and S3 location.
+3. Implement a dedicated MoleculeNet benchmark pipeline for InterpreMol and Chemprop v2.
+4. Support both transfer modes for InterpreMol: full fine-tuning and frozen encoder.
+5. Run both random and scaffold split evaluations across the selected MoleculeNet tasks with 3 seeds.
+6. Save per-run metrics, per-split predictions, and aggregate benchmark tables.
+7. Produce plots for every benchmark family and for the final aggregate comparison.
+8. Revalidate integrated gradients on the finalized model checkpoints.
+9. Run qualitative interpretability case studies on chemically meaningful examples and record both strong and weak cases.
 
 ## References
 

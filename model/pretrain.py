@@ -46,6 +46,101 @@ from train import (
     masked_mse_loss,
 )
 from aws_utils import S3Manager, CheckpointManager, get_instance_metadata
+from task_manifest import (
+    build_task_manifest,
+    load_task_manifest,
+    save_task_manifest,
+    select_label_cols,
+    selected_task_types,
+    summarize_manifest,
+)
+
+
+def masked_multiclass_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Cross-entropy loss with masking for multiclass wide-table tasks.
+
+    Args:
+        logits: [batch_size, n_tasks, n_classes]
+        labels: [batch_size, n_tasks]
+        mask: [batch_size, n_tasks]
+    """
+    if mask.sum() == 0:
+        return logits.sum() * 0.0
+
+    labels_clean = torch.where(mask, labels, torch.zeros_like(labels)).long()
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_labels = labels_clean.reshape(-1)
+    flat_mask = mask.reshape(-1)
+
+    valid_logits = flat_logits[flat_mask]
+    valid_labels = flat_labels[flat_mask]
+    return nn.functional.cross_entropy(valid_logits, valid_labels)
+
+
+def build_task_groups_from_manifest(manifest: Dict[str, Any], include_flag: str) -> Dict[str, Any]:
+    """Build typed task group metadata aligned to the selected label order."""
+    selected_tasks = [task for task in manifest["tasks"] if task.get(include_flag, False)]
+    task_to_index = {task["task_name"]: idx for idx, task in enumerate(selected_tasks)}
+
+    groups: Dict[str, Any] = {"selected_label_cols": [task["task_name"] for task in selected_tasks]}
+    grouped_tasks: Dict[str, List[Dict[str, Any]]] = {}
+
+    for task in selected_tasks:
+        group_name = f"{task['task_type']}::{task['broad_family']}"
+        grouped_tasks.setdefault(group_name, []).append(task)
+
+    for group_name, group_tasks in grouped_tasks.items():
+        groups[group_name] = {
+            "label_cols": [task["task_name"] for task in group_tasks],
+            "indices": [task_to_index[task["task_name"]] for task in group_tasks],
+            "out_dim": len(group_tasks),
+            "num_classes": int(group_tasks[0]["num_classes"]),
+            "task_type": group_tasks[0]["task_type"],
+            "broad_family": group_tasks[0]["broad_family"],
+        }
+
+    return groups
+
+
+def build_typed_criterion(config: Dict):
+    """Create a mixed-task criterion from manifest-derived task groups."""
+    task_groups = config.get("task_groups")
+    if not task_groups:
+        raise ValueError("Typed-task criterion requested without config['task_groups'].")
+
+    def criterion(preds, labels, masks):
+        losses = []
+
+        for group_name, group_cfg in task_groups.items():
+            if group_name == "selected_label_cols" or group_cfg["out_dim"] == 0:
+                continue
+
+            idx = torch.tensor(group_cfg["indices"], device=labels.device, dtype=torch.long)
+            group_labels = labels.index_select(1, idx)
+            group_masks = masks.index_select(1, idx)
+            group_preds = preds[group_name]
+
+            if group_cfg["task_type"] == "binary":
+                group_loss = masked_bce_loss(group_preds, group_labels, group_masks)
+            elif group_cfg["task_type"] == "multiclass":
+                group_loss = masked_multiclass_loss(group_preds, group_labels, group_masks)
+            else:
+                raise ValueError(f"Unsupported task group type: {group_cfg['task_type']}")
+
+            losses.append(group_loss)
+
+        if not losses:
+            raise ValueError("No active typed-task groups were selected for training.")
+
+        return sum(losses) / len(losses)
+
+    return criterion
+
+
+def sanitize_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop ephemeral runtime-only config keys before serialization."""
+    return {k: v for k, v in config.items() if not str(k).startswith("_")}
 
 
 def resolve_project_path(path_str: str) -> str:
@@ -71,6 +166,8 @@ def get_default_config() -> Dict[str, Any]:
         "data_file": "datasets/all_datasets_fused_standardized.parquet",
         "smiles_col": "SMILES_std",
         "label_cols": None,  # Auto-detect
+        "task_manifest": None,
+        "task_manifest_include_flag": "include_in_stage2",
         "val_frac": 0.05,
         "seed": 42,
 
@@ -97,6 +194,10 @@ def get_default_config() -> Dict[str, Any]:
         "warmup_epochs": 5,
         "early_stopping_patience": 10,
         "loss": "multitask-bce",
+        "family_loss_weights": {
+            "binary": 1.0,
+            "multiclass": 1.0,
+        },
 
         # Mixed precision
         "use_amp": True,
@@ -145,6 +246,37 @@ def setup_data(config: Dict) -> tuple:
 
     smiles_col = config["smiles_col"]
     label_cols = config.get("label_cols")
+    task_manifest_path = config.get("task_manifest")
+    include_flag = config.get("task_manifest_include_flag", "include_in_stage2")
+
+    if task_manifest_path:
+        manifest = load_task_manifest(task_manifest_path)
+        task_groups = build_task_groups_from_manifest(manifest, include_flag=include_flag)
+        label_cols = task_groups["selected_label_cols"]
+        config["label_cols"] = label_cols
+        config["task_groups"] = task_groups
+        config["task_heads"] = {
+            group_name: {
+                "out_dim": group_cfg["out_dim"],
+                "num_classes": group_cfg["num_classes"],
+            }
+            for group_name, group_cfg in task_groups.items()
+            if group_name != "selected_label_cols" and group_cfg["out_dim"] > 0
+        }
+        config["task_manifest_summary"] = summarize_manifest(manifest)
+        config["selected_task_types"] = dict(selected_task_types(manifest, include_flag=include_flag))
+        print(f"Using task manifest {task_manifest_path}")
+        print(f"Task manifest summary: {config['task_manifest_summary']}")
+        print(f"Selected task types: {config['selected_task_types']}")
+
+        if config["loss"] == "multitask-bce" and any(
+            task_type != "binary" for task_type in config["selected_task_types"]
+        ):
+            raise ValueError(
+                "Selected task manifest includes non-binary tasks, but config['loss'] is "
+                "'multitask-bce'. Use a manifest subset that is purely binary or implement "
+                "typed-task losses before launching pretraining."
+            )
 
     # Use streaming for parquet files (memory efficient)
     if config["data_file"].endswith(".parquet") and config.get("streaming", True):
@@ -160,10 +292,12 @@ def setup_data(config: Dict) -> tuple:
             max_tasks=config.get("max_tasks"),
             max_atoms=config.get("max_atoms"),
             shuffle_buffer_size=config.get("shuffle_buffer_size", 1000),
+            pin_memory=config.get("pin_memory", True),
         )
 
         config["n_tasks"] = n_tasks
-        config["out_dim"] = n_tasks
+        if not config.get("task_heads"):
+            config["out_dim"] = n_tasks
 
         return train_loader, val_loader
 
@@ -213,7 +347,8 @@ def setup_data(config: Dict) -> tuple:
     )
 
     config["n_tasks"] = train_ds.n_tasks
-    config["out_dim"] = train_ds.n_tasks
+    if not config.get("task_heads"):
+        config["out_dim"] = train_ds.n_tasks
 
     return train_loader, val_loader
 
@@ -393,6 +528,7 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         Results dict with final metrics
     """
     device = config["device"]
+    saved_config = sanitize_runtime_config(config)
     print(f"Training on device: {device}")
 
     # Check if on EC2
@@ -420,7 +556,9 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
     model, optimizer, scheduler = setup_model(config, device)
 
     # Setup loss
-    if config["loss"] == "multitask-bce":
+    if config["loss"] == "typed-multitask":
+        criterion = build_typed_criterion(config)
+    elif config["loss"] == "multitask-bce":
         criterion = masked_bce_loss
     elif config["loss"] == "multitask-mse":
         criterion = masked_mse_loss
@@ -447,6 +585,7 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
     train_losses = []
     val_losses = []
     epochs_without_improvement = 0
+    report_fn = config.get("_report_fn")
 
     for epoch in range(start_epoch, config["epochs"]):
         print(f"\n{'='*50}")
@@ -464,11 +603,20 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         val_loss = validate(model, val_loader, criterion, device, config)
         val_losses.append(val_loss)
 
-        # Step scheduler
-        scheduler.step()
+        # Step scheduler only if at least one optimizer step likely occurred.
+        if train_loss != 0.0:
+            scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.2e}")
+
+        if report_fn is not None:
+            report_fn({
+                "training_iteration": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "lr": current_lr,
+            })
 
         # Check for improvement
         is_best = val_loss < best_val_loss
@@ -481,7 +629,7 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         # Save checkpoint
         if (epoch + 1) % config["checkpoint_every"] == 0 or is_best:
             ckpt_manager.save_checkpoint(
-                model, optimizer, epoch + 1, val_loss, config,
+                model, optimizer, epoch + 1, val_loss, saved_config,
                 is_best=is_best,
                 extra={
                     'best_val_loss': best_val_loss,
@@ -503,7 +651,7 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         'final_epoch': epoch + 1,
         'train_losses': train_losses,
         'val_losses': val_losses,
-        'config': config,
+        'config': saved_config,
         'n_tasks': config.get('n_tasks'),
         'timestamp': datetime.now().isoformat(),
     }
@@ -529,34 +677,52 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
     from ray.tune.schedulers import ASHAScheduler
 
     # Define search space
+    architecture_choices = [
+        {"d_model": 192, "n_layers": 4},
+        {"d_model": 192, "n_layers": 6},
+        {"d_model": 192, "n_layers": 8},
+        {"d_model": 256, "n_layers": 4},
+        {"d_model": 256, "n_layers": 6},
+        {"d_model": 256, "n_layers": 8},
+        {"d_model": 384, "n_layers": 4},
+        {"d_model": 384, "n_layers": 6},
+        {"d_model": 384, "n_layers": 8},
+        {"d_model": 512, "n_layers": 4},
+        {"d_model": 512, "n_layers": 6},
+    ]
     search_space = {
         **config,
         # Keep trials within a stable region for single A10G GPUs.
-        "use_amp": False,
-        "lr": tune.loguniform(1e-5, 1e-3),
-        "weight_decay": tune.loguniform(1e-6, 1e-2),
+        "use_amp": config.get("use_amp", True),
+        "architecture": tune.choice(architecture_choices),
+        "lr": tune.loguniform(3e-5, 3e-4),
+        "weight_decay": tune.loguniform(1e-6, 3e-4),
         "batch_size": tune.choice([4, 8, 16]),
         "grad_accum_steps": tune.choice([1, 2, 4]),
-        "d_model": tune.choice([128, 256]),
-        "n_layers": tune.choice([4, 6]),
-        "n_heads": tune.choice([4, 8]),
-        "dim_ff": tune.choice([256, 512]),
-        "dropout": tune.uniform(0.0, 0.3),
-        "mlp_hidden_dim": tune.choice([256, 512]),
-        "mlp_head_depth": tune.choice([2, 3]),
-        "use_edge_bias": tune.choice([True, False]),
+        "n_heads": 8,
+        "dropout": tune.uniform(0.05, 0.20),
+        "mlp_head_depth": 2,
+        "use_edge_bias": True,
         "max_distance": tune.choice([4, 6, 8]),
     }
 
     def trainable(trial_config):
+        trial_config = dict(trial_config)
+        architecture = trial_config.pop("architecture")
+        trial_config.update(architecture)
+        trial_config["dim_ff"] = 2 * trial_config["d_model"]
+        trial_config["mlp_hidden_dim"] = 2 * trial_config["d_model"]
+
+        def _report(metrics):
+            try:
+                tune.report(metrics)
+            except TypeError:
+                tune.report(**metrics)
+
+        trial_config["_report_fn"] = _report
         results = train(trial_config)
-        # Ray Tune API differs across versions:
-        # - newer versions expect a single metrics dict
-        # - older versions accept keyword arguments
-        try:
-            tune.report({"val_loss": results['best_val_loss']})
-        except TypeError:
-            tune.report(val_loss=results['best_val_loss'])
+        if results["best_val_loss"] == float("inf"):
+            _report({"training_iteration": results["final_epoch"], "val_loss": float("inf")})
 
     max_t = int(config["epochs"])
     grace_cfg = config.get("hpo_grace_period")
@@ -598,6 +764,10 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
         analysis = tune.run(**run_kwargs)
 
     best_config = analysis.get_best_config(metric="val_loss", mode="min")
+    architecture = best_config.pop("architecture")
+    best_config.update(architecture)
+    best_config["dim_ff"] = 2 * best_config["d_model"]
+    best_config["mlp_hidden_dim"] = 2 * best_config["d_model"]
     print(f"Best config: {best_config}")
 
     # Save best config
@@ -613,6 +783,9 @@ def main():
     parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
     parser.add_argument("--hyperopt", action="store_true", help="Run hyperparameter optimization")
     parser.add_argument("--num-samples", type=int, default=30, help="Number of hyperopt trials")
+    parser.add_argument("--task-manifest", type=str, help="Path to a task manifest JSON file")
+    parser.add_argument("--write-task-manifest", type=str, help="Write a task manifest JSON file before training")
+    parser.add_argument("--audit-only", action="store_true", help="Only build/write task manifest and exit")
 
     # Override config options from command line
     parser.add_argument("--data-file", type=str, help="Path to data file")
@@ -640,6 +813,8 @@ def main():
     # Override with command line args
     if args.data_file:
         config["data_file"] = args.data_file
+    if args.task_manifest:
+        config["task_manifest"] = args.task_manifest
     if args.batch_size is not None:
         config["batch_size"] = args.batch_size
     if args.gradient_accumulation is not None:
@@ -674,10 +849,21 @@ def main():
     # Resolve important paths once so Ray workers get absolute paths.
     config["data_file"] = resolve_project_path(config["data_file"])
     config["checkpoint_dir"] = resolve_project_path(config["checkpoint_dir"])
+    if config.get("task_manifest"):
+        config["task_manifest"] = resolve_project_path(config["task_manifest"])
 
     # Print config
     print("Configuration:")
     print(json.dumps(config, indent=2, default=str))
+
+    if args.write_task_manifest:
+        task_manifest_path = resolve_project_path(args.write_task_manifest)
+        manifest = build_task_manifest(config["data_file"], smiles_col=config["smiles_col"])
+        save_task_manifest(manifest, task_manifest_path)
+        print(f"\nTask manifest written to {task_manifest_path}")
+        print(summarize_manifest(manifest))
+        if args.audit_only:
+            return
 
     # Run
     if args.hyperopt:

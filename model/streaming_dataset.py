@@ -254,6 +254,7 @@ def create_streaming_dataloaders(
     max_atoms: Optional[int] = None,
     shuffle_buffer_size: int = 1000,
     task_chunk_size: int = 200,
+    pin_memory: bool = True,
 ):
     """
     Create train/val dataloaders that stream from parquet.
@@ -300,7 +301,7 @@ def create_streaming_dataloaders(
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
 
     val_loader = DataLoader(
@@ -308,7 +309,7 @@ def create_streaming_dataloaders(
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
 
     return train_loader, val_loader, train_ds.n_tasks
