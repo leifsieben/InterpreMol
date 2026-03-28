@@ -198,7 +198,12 @@ def build_task_manifest(data_file: str, smiles_col: str = "SMILES_std", task_chu
         family_summary[family]["include_in_hpo"] += int(task["include_in_hpo"])
         family_summary[family]["include_in_stage2"] += int(task["include_in_stage2"])
 
-    normalized_family_summary = {
+    manifest["family_summary"] = _normalize_family_summary(family_summary)
+    return manifest
+
+
+def _normalize_family_summary(family_summary: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {
         family: {
             **summary,
             "task_types": dict(summary["task_types"]),
@@ -206,7 +211,26 @@ def build_task_manifest(data_file: str, smiles_col: str = "SMILES_std", task_chu
         for family, summary in family_summary.items()
     }
 
-    manifest["family_summary"] = normalized_family_summary
+
+def recompute_family_summary(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    family_summary: Dict[str, Dict[str, Any]] = {}
+    tasks = manifest["tasks"]
+    for task in tasks:
+        family = task["broad_family"]
+        family_summary.setdefault(
+            family,
+            {
+                "n_tasks": 0,
+                "task_types": Counter(),
+                "include_in_hpo": 0,
+                "include_in_stage2": 0,
+            },
+        )
+        family_summary[family]["n_tasks"] += 1
+        family_summary[family]["task_types"][task["task_type"]] += 1
+        family_summary[family]["include_in_hpo"] += int(task["include_in_hpo"])
+        family_summary[family]["include_in_stage2"] += int(task["include_in_stage2"])
+    manifest["family_summary"] = _normalize_family_summary(family_summary)
     return manifest
 
 
@@ -220,6 +244,69 @@ def save_task_manifest(manifest: Dict[str, Any], output_path: str) -> None:
 def load_task_manifest(path: str) -> Dict[str, Any]:
     with open(path) as f:
         return json.load(f)
+
+
+def build_balanced_subset_manifest(
+    manifest: Dict[str, Any],
+    limits_by_subfamily: Dict[str, int],
+    include_flag: str = "include_in_stage2",
+) -> Dict[str, Any]:
+    """
+    Build a manifest copy that enables only the densest tasks from selected subfamilies.
+
+    Tasks are ranked by valid_count descending within each subfamily.
+    """
+    manifest_copy = json.loads(json.dumps(manifest))
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for task in manifest_copy["tasks"]:
+        grouped.setdefault(task["subfamily"], []).append(task)
+
+    keep = set()
+    for subfamily, limit in limits_by_subfamily.items():
+        tasks = sorted(grouped.get(subfamily, []), key=lambda t: t["valid_count"], reverse=True)
+        keep.update(task["task_name"] for task in tasks[:limit])
+
+    for task in manifest_copy["tasks"]:
+        task["include_in_hpo"] = task["task_name"] in keep
+        task["include_in_stage2"] = task["task_name"] in keep
+
+    manifest_copy["subset_summary"] = {
+        "include_flag": include_flag,
+        "limits_by_subfamily": limits_by_subfamily,
+        "selected_tasks": len(keep),
+    }
+    return recompute_family_summary(manifest_copy)
+
+
+def build_hpo_subset_manifest(
+    manifest: Dict[str, Any],
+    limits_by_subfamily: Dict[str, int],
+) -> Dict[str, Any]:
+    """
+    Build a manifest copy that narrows only the HPO subset.
+
+    `include_in_stage2` is preserved so the full manifest can still drive the
+    promoted Stage 2 training run.
+    """
+    manifest_copy = json.loads(json.dumps(manifest))
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for task in manifest_copy["tasks"]:
+        grouped.setdefault(task["subfamily"], []).append(task)
+
+    keep = set()
+    for subfamily, limit in limits_by_subfamily.items():
+        tasks = sorted(grouped.get(subfamily, []), key=lambda t: t["valid_count"], reverse=True)
+        keep.update(task["task_name"] for task in tasks[:limit])
+
+    for task in manifest_copy["tasks"]:
+        task["include_in_hpo"] = task["task_name"] in keep
+
+    manifest_copy["subset_summary"] = {
+        "include_flag": "include_in_hpo",
+        "limits_by_subfamily": limits_by_subfamily,
+        "selected_tasks": len(keep),
+    }
+    return recompute_family_summary(manifest_copy)
 
 
 def select_label_cols(manifest: Dict[str, Any], include_flag: str = "include_in_stage2") -> List[str]:

@@ -1,0 +1,19 @@
+{
+  "loss": "typed-multitask",
+  "task_manifest_include_flag": "include_in_stage2",
+  "streaming": true,
+  "use_amp": true,
+  "num_workers": 0,
+  "pin_memory": true,
+  "batch_size": 8,
+  "grad_accum_steps": 2,
+  "epochs": 40,
+  "warmup_epochs": 5,
+  "early_stopping_patience": 8,
+  "checkpoint_every": 1,
+  "keep_last_n": 5,
+  "log_every": 100,
+  "max_atoms": 192,
+  "min_val_group_count": 1,
+  "enforce_val_group_coverage": true
+}

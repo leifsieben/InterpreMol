@@ -25,6 +25,7 @@ import os
 import sys
 import json
 import argparse
+import math
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -47,6 +48,8 @@ from train import (
 )
 from aws_utils import S3Manager, CheckpointManager, get_instance_metadata
 from task_manifest import (
+    build_balanced_subset_manifest,
+    build_hpo_subset_manifest,
     build_task_manifest,
     load_task_manifest,
     save_task_manifest,
@@ -78,6 +81,27 @@ def masked_multiclass_loss(logits: torch.Tensor, labels: torch.Tensor, mask: tor
     return nn.functional.cross_entropy(valid_logits, valid_labels)
 
 
+def _binary_baseline_loss(class_counts: Dict[str, int]) -> float:
+    total = sum(class_counts.values())
+    if total == 0:
+        return 1.0
+    pos = float(class_counts.get("1", 0))
+    p = min(max(pos / total, 1e-6), 1 - 1e-6)
+    return float(-(p * math.log(p) + (1.0 - p) * math.log(1.0 - p)))
+
+
+def _multiclass_baseline_loss(class_counts: Dict[str, int]) -> float:
+    total = sum(class_counts.values())
+    if total == 0:
+        return 1.0
+    baseline = 0.0
+    for count in class_counts.values():
+        prob = count / total
+        if prob > 0:
+            baseline -= prob * math.log(prob)
+    return float(max(baseline, 1e-6))
+
+
 def build_task_groups_from_manifest(manifest: Dict[str, Any], include_flag: str) -> Dict[str, Any]:
     """Build typed task group metadata aligned to the selected label order."""
     selected_tasks = [task for task in manifest["tasks"] if task.get(include_flag, False)]
@@ -91,6 +115,13 @@ def build_task_groups_from_manifest(manifest: Dict[str, Any], include_flag: str)
         grouped_tasks.setdefault(group_name, []).append(task)
 
     for group_name, group_tasks in grouped_tasks.items():
+        if group_tasks[0]["task_type"] == "binary":
+            baseline_losses = [_binary_baseline_loss(task["class_counts"]) for task in group_tasks]
+        elif group_tasks[0]["task_type"] == "multiclass":
+            baseline_losses = [_multiclass_baseline_loss(task["class_counts"]) for task in group_tasks]
+        else:
+            baseline_losses = [1.0 for _ in group_tasks]
+
         groups[group_name] = {
             "label_cols": [task["task_name"] for task in group_tasks],
             "indices": [task_to_index[task["task_name"]] for task in group_tasks],
@@ -98,21 +129,24 @@ def build_task_groups_from_manifest(manifest: Dict[str, Any], include_flag: str)
             "num_classes": int(group_tasks[0]["num_classes"]),
             "task_type": group_tasks[0]["task_type"],
             "broad_family": group_tasks[0]["broad_family"],
+            "baseline_loss": float(sum(baseline_losses) / max(len(baseline_losses), 1)),
         }
 
     return groups
 
 
-def build_typed_criterion(config: Dict):
-    """Create a mixed-task criterion from manifest-derived task groups."""
-    task_groups = config.get("task_groups")
-    if not task_groups:
-        raise ValueError("Typed-task criterion requested without config['task_groups'].")
+class TypedTaskCriterion:
+    """Mixed-task criterion with family-aware normalized losses."""
 
-    def criterion(preds, labels, masks):
-        losses = []
+    def __init__(self, task_groups: Dict[str, Any]):
+        self.task_groups = task_groups
 
-        for group_name, group_cfg in task_groups.items():
+    def compute_components(self, preds, labels, masks) -> Dict[str, Any]:
+        components: Dict[str, Any] = {"groups": {}}
+        normalized_losses = []
+        total_valid = 0
+
+        for group_name, group_cfg in self.task_groups.items():
             if group_name == "selected_label_cols" or group_cfg["out_dim"] == 0:
                 continue
 
@@ -120,27 +154,99 @@ def build_typed_criterion(config: Dict):
             group_labels = labels.index_select(1, idx)
             group_masks = masks.index_select(1, idx)
             group_preds = preds[group_name]
+            valid_count = int(group_masks.sum().item())
 
             if group_cfg["task_type"] == "binary":
-                group_loss = masked_bce_loss(group_preds, group_labels, group_masks)
+                raw_loss = masked_bce_loss(group_preds, group_labels, group_masks)
             elif group_cfg["task_type"] == "multiclass":
-                group_loss = masked_multiclass_loss(group_preds, group_labels, group_masks)
+                raw_loss = masked_multiclass_loss(group_preds, group_labels, group_masks)
             else:
                 raise ValueError(f"Unsupported task group type: {group_cfg['task_type']}")
 
-            losses.append(group_loss)
+            baseline = max(float(group_cfg.get("baseline_loss", 1.0)), 1e-6)
+            normalized_loss = raw_loss / baseline
 
-        if not losses:
+            components["groups"][group_name] = {
+                "raw_loss": raw_loss,
+                "normalized_loss": normalized_loss,
+                "valid_count": valid_count,
+                "baseline_loss": baseline,
+                "broad_family": group_cfg["broad_family"],
+                "task_type": group_cfg["task_type"],
+            }
+            normalized_losses.append(normalized_loss)
+            total_valid += valid_count
+
+        if not normalized_losses:
             raise ValueError("No active typed-task groups were selected for training.")
 
-        return sum(losses) / len(losses)
+        components["total_loss"] = sum(normalized_losses) / len(normalized_losses)
+        components["total_valid"] = total_valid
+        return components
 
-    return criterion
+    def __call__(self, preds, labels, masks):
+        return self.compute_components(preds, labels, masks)["total_loss"]
+
+
+def build_typed_criterion(config: Dict):
+    """Create a mixed-task criterion from manifest-derived task groups."""
+    task_groups = config.get("task_groups")
+    if not task_groups:
+        raise ValueError("Typed-task criterion requested without config['task_groups'].")
+    return TypedTaskCriterion(task_groups)
 
 
 def sanitize_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Drop ephemeral runtime-only config keys before serialization."""
     return {k: v for k, v in config.items() if not str(k).startswith("_")}
+
+
+def get_required_val_groups(config: Dict[str, Any]) -> list[str]:
+    """Return the task groups that must appear in validation for selection/HPO."""
+    explicit = config.get("required_val_groups")
+    if explicit:
+        return list(explicit)
+
+    task_groups = config.get("task_groups", {})
+    return [
+        group_name
+        for group_name, group_cfg in task_groups.items()
+        if group_name != "selected_label_cols" and group_cfg.get("out_dim", 0) > 0
+    ]
+
+
+def finalize_val_metrics(config: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach validation coverage diagnostics and the guarded selection loss."""
+    required_groups = get_required_val_groups(config)
+    min_group_count = int(config.get("min_val_group_count", 1))
+    enforce_coverage = bool(config.get("enforce_val_group_coverage", True))
+
+    group_valid_counts = metrics.get("group_valid_counts", {})
+    covered_groups = [
+        group_name for group_name in required_groups
+        if int(group_valid_counts.get(group_name, 0)) >= min_group_count
+    ]
+    missing_groups = [group_name for group_name in required_groups if group_name not in covered_groups]
+    coverage_ratio = (
+        float(len(covered_groups) / len(required_groups))
+        if required_groups else 1.0
+    )
+    coverage_ok = (not required_groups) or not missing_groups
+
+    selection_loss = metrics["loss"]
+    if enforce_coverage and not coverage_ok:
+        selection_loss = float("inf")
+
+    metrics = dict(metrics)
+    metrics.update({
+        "required_groups": required_groups,
+        "covered_groups": covered_groups,
+        "missing_groups": missing_groups,
+        "coverage_ratio": coverage_ratio,
+        "coverage_ok": coverage_ok,
+        "selection_loss": selection_loss,
+    })
+    return metrics
 
 
 def resolve_project_path(path_str: str) -> str:
@@ -220,6 +326,9 @@ def get_default_config() -> Dict[str, Any]:
         "log_every": 100,  # batches
         "max_train_batches_per_epoch": None,  # optional smoke-test limiter
         "max_val_batches": None,  # optional smoke-test limiter
+        "required_val_groups": None,  # None -> require all active typed-task groups
+        "min_val_group_count": 1,
+        "enforce_val_group_coverage": True,
 
         # HPO scheduler
         "hpo_grace_period": None,  # None -> min(10, epochs)
@@ -242,6 +351,8 @@ def load_config(config_path: Optional[str]) -> Dict[str, Any]:
 def setup_data(config: Dict) -> tuple:
     """Set up data loaders."""
     config["data_file"] = resolve_project_path(config["data_file"])
+    if not str(config.get("device", "")).startswith("cuda") and config.get("pin_memory", True):
+        config["pin_memory"] = False
     print(f"Loading data from {config['data_file']}...")
 
     smiles_col = config["smiles_col"]
@@ -258,7 +369,7 @@ def setup_data(config: Dict) -> tuple:
         config["task_heads"] = {
             group_name: {
                 "out_dim": group_cfg["out_dim"],
-                "num_classes": group_cfg["num_classes"],
+                "num_classes": 1 if group_cfg["task_type"] == "binary" else group_cfg["num_classes"],
             }
             for group_name, group_cfg in task_groups.items()
             if group_name != "selected_label_cols" and group_cfg["out_dim"] > 0
@@ -368,11 +479,16 @@ def setup_model(config: Dict, device: str) -> tuple:
 
     # Cosine annealing with warmup
     def lr_lambda(epoch):
-        if epoch < config["warmup_epochs"]:
-            return epoch / config["warmup_epochs"]
-        else:
-            progress = (epoch - config["warmup_epochs"]) / (config["epochs"] - config["warmup_epochs"])
-            return 0.5 * (1 + np.cos(np.pi * progress))
+        warmup_epochs = max(int(config["warmup_epochs"]), 0)
+        total_epochs = max(int(config["epochs"]), 1)
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        if total_epochs <= warmup_epochs:
+            return 1.0
+
+        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1 + np.cos(np.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -388,17 +504,20 @@ def train_epoch(
     config: Dict,
     scaler: Optional[GradScaler] = None,
     epoch: int = 0
-) -> float:
+) -> Dict[str, Any]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
     total_samples = 0
+    processed_batches = 0
     grad_accum_steps = max(1, int(config["grad_accum_steps"]))
     use_amp = bool(config.get("use_amp", False) and scaler is not None and str(device).startswith("cuda"))
     max_oom_skips = int(config.get("max_oom_skips_per_epoch", 20))
     accum_counter = 0
     skipped_no_label = 0
     skipped_oom = 0
+    group_loss_sums: Dict[str, float] = {}
+    group_valid_counts: Dict[str, int] = {}
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
     optimizer.zero_grad(set_to_none=True)
@@ -419,7 +538,7 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, (mols, labels, masks) in enumerate(pbar):
-        if max_train_batches is not None and batch_idx >= int(max_train_batches):
+        if max_train_batches is not None and processed_batches >= int(max_train_batches):
             break
         labels = labels.to(device)
         masks = masks.to(device)
@@ -461,8 +580,22 @@ def train_epoch(
         if accum_counter % grad_accum_steps == 0:
             _optimizer_step()
 
-        total_loss += loss.item() * grad_accum_steps * batch_samples
+        loss_value = loss.item() * grad_accum_steps
+        total_loss += loss_value * batch_samples
         total_samples += batch_samples
+        processed_batches += 1
+
+        if hasattr(criterion, "compute_components"):
+            with torch.no_grad():
+                components = criterion.compute_components(preds, labels, masks)
+            for group_name, group_metrics in components["groups"].items():
+                valid_count = int(group_metrics["valid_count"])
+                if valid_count == 0:
+                    continue
+                group_loss_sums[group_name] = group_loss_sums.get(group_name, 0.0) + (
+                    float(group_metrics["normalized_loss"].item()) * valid_count
+                )
+                group_valid_counts[group_name] = group_valid_counts.get(group_name, 0) + valid_count
 
         if (batch_idx + 1) % config["log_every"] == 0:
             avg_loss = total_loss / max(total_samples, 1)
@@ -478,7 +611,16 @@ def train_epoch(
             f"and {skipped_oom} OOM batches"
         )
 
-    return total_loss / max(total_samples, 1)
+    return {
+        "loss": total_loss / max(total_samples, 1),
+        "processed_batches": processed_batches,
+        "total_samples": total_samples,
+        "group_losses": {
+            group_name: group_loss_sums[group_name] / max(group_valid_counts[group_name], 1)
+            for group_name in group_loss_sums
+        },
+        "group_valid_counts": group_valid_counts,
+    }
 
 
 @torch.no_grad()
@@ -488,18 +630,27 @@ def validate(
     criterion,
     device: str,
     config: Dict
-) -> float:
+) -> Dict[str, Any]:
     """Validate the model."""
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    processed_batches = 0
     max_val_batches = config.get("max_val_batches")
+    skipped_no_label = 0
+    group_loss_sums: Dict[str, float] = {}
+    group_valid_counts: Dict[str, int] = {}
 
     for batch_idx, (mols, labels, masks) in enumerate(tqdm(val_loader, desc="Validating")):
-        if max_val_batches is not None and batch_idx >= int(max_val_batches):
+        if max_val_batches is not None and processed_batches >= int(max_val_batches):
             break
         labels = labels.to(device)
         masks = masks.to(device)
+        batch_samples = int(masks.sum().item())
+
+        if batch_samples == 0:
+            skipped_no_label += 1
+            continue
 
         if config["use_amp"] and str(device).startswith("cuda"):
             with torch.amp.autocast("cuda", enabled=True):
@@ -509,11 +660,34 @@ def validate(
             preds = model(mols)
             loss = criterion(preds, labels, masks)
 
-        batch_samples = masks.sum().item()
         total_loss += loss.item() * batch_samples
         total_samples += batch_samples
+        processed_batches += 1
 
-    return total_loss / max(total_samples, 1)
+        if hasattr(criterion, "compute_components"):
+            components = criterion.compute_components(preds, labels, masks)
+            for group_name, group_metrics in components["groups"].items():
+                valid_count = int(group_metrics["valid_count"])
+                if valid_count == 0:
+                    continue
+                group_loss_sums[group_name] = group_loss_sums.get(group_name, 0.0) + (
+                    float(group_metrics["normalized_loss"].item()) * valid_count
+                )
+                group_valid_counts[group_name] = group_valid_counts.get(group_name, 0) + valid_count
+
+    if skipped_no_label > 0:
+        print(f"Validation skipped {skipped_no_label} empty-label batches")
+
+    return {
+        "loss": total_loss / max(total_samples, 1),
+        "processed_batches": processed_batches,
+        "total_samples": total_samples,
+        "group_losses": {
+            group_name: group_loss_sums[group_name] / max(group_valid_counts[group_name], 1)
+            for group_name in group_loss_sums
+        },
+        "group_valid_counts": group_valid_counts,
+    }
 
 
 def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
@@ -584,6 +758,10 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
     # Training loop
     train_losses = []
     val_losses = []
+    val_selection_losses = []
+    train_group_history = []
+    val_group_history = []
+    val_coverage_history = []
     epochs_without_improvement = 0
     report_fn = config.get("_report_fn")
 
@@ -593,29 +771,64 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         print(f"{'='*50}")
 
         # Train
-        train_loss = train_epoch(
+        train_metrics = train_epoch(
             model, train_loader, optimizer, criterion,
             device, config, scaler, epoch
         )
+        train_loss = train_metrics["loss"]
         train_losses.append(train_loss)
+        train_group_history.append(train_metrics["group_losses"])
 
         # Validate
-        val_loss = validate(model, val_loader, criterion, device, config)
-        val_losses.append(val_loss)
+        val_metrics = finalize_val_metrics(
+            config,
+            validate(model, val_loader, criterion, device, config),
+        )
+        raw_val_loss = val_metrics["loss"]
+        val_loss = val_metrics["selection_loss"]
+        val_losses.append(raw_val_loss)
+        val_selection_losses.append(val_loss)
+        val_group_history.append(val_metrics["group_losses"])
+        val_coverage_history.append({
+            "coverage_ratio": val_metrics["coverage_ratio"],
+            "coverage_ok": val_metrics["coverage_ok"],
+            "missing_groups": val_metrics["missing_groups"],
+            "group_valid_counts": val_metrics["group_valid_counts"],
+        })
 
         # Step scheduler only if at least one optimizer step likely occurred.
-        if train_loss != 0.0:
+        if train_metrics["processed_batches"] > 0:
             scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.2e}")
+        print(
+            f"Train Loss: {train_loss:.4f} | "
+            f"Val Loss(raw/selection): {raw_val_loss:.4f}/{val_loss:.4f} | "
+            f"LR: {current_lr:.2e}"
+        )
+        if train_metrics["group_losses"] or val_metrics["group_losses"]:
+            print(f"Train groups: {train_metrics['group_losses']}")
+            print(f"Val groups: {val_metrics['group_losses']}")
+        if val_metrics["required_groups"]:
+            print(
+                f"Val coverage: {len(val_metrics['covered_groups'])}/{len(val_metrics['required_groups'])} "
+                f"groups (min_count={config.get('min_val_group_count', 1)})"
+            )
+            if not val_metrics["coverage_ok"]:
+                print(f"Missing val groups: {val_metrics['missing_groups']}")
 
         if report_fn is not None:
             report_fn({
                 "training_iteration": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "val_loss_raw": raw_val_loss,
                 "lr": current_lr,
+                "val_coverage_ratio": val_metrics["coverage_ratio"],
+                "val_coverage_ok": float(val_metrics["coverage_ok"]),
+                **{f"train_{k}": v for k, v in train_metrics["group_losses"].items()},
+                **{f"val_{k}": v for k, v in val_metrics["group_losses"].items()},
+                **{f"val_count_{k}": v for k, v in val_metrics["group_valid_counts"].items()},
             })
 
         # Check for improvement
@@ -635,6 +848,10 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
                     'best_val_loss': best_val_loss,
                     'train_losses': train_losses,
                     'val_losses': val_losses,
+                    'val_selection_losses': val_selection_losses,
+                    'train_group_history': train_group_history,
+                    'val_group_history': val_group_history,
+                    'val_coverage_history': val_coverage_history,
                 }
             )
             print(f"Checkpoint saved (is_best={is_best})")
@@ -651,6 +868,10 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         'final_epoch': epoch + 1,
         'train_losses': train_losses,
         'val_losses': val_losses,
+        'val_selection_losses': val_selection_losses,
+        'train_group_history': train_group_history,
+        'val_group_history': val_group_history,
+        'val_coverage_history': val_coverage_history,
         'config': saved_config,
         'n_tasks': config.get('n_tasks'),
         'timestamp': datetime.now().isoformat(),
@@ -785,6 +1006,12 @@ def main():
     parser.add_argument("--num-samples", type=int, default=30, help="Number of hyperopt trials")
     parser.add_argument("--task-manifest", type=str, help="Path to a task manifest JSON file")
     parser.add_argument("--write-task-manifest", type=str, help="Write a task manifest JSON file before training")
+    parser.add_argument("--write-balanced-subset-manifest", type=str, help="Write a balanced subset task manifest JSON file")
+    parser.add_argument("--write-hpo-subset-manifest", type=str, help="Write an HPO-only subset task manifest JSON file")
+    parser.add_argument("--subset-wong", type=int, help="Number of Wong_fused tasks to keep in balanced subset manifest")
+    parser.add_argument("--subset-pcba", type=int, help="Number of PCBA_1328 tasks to keep in balanced subset manifest")
+    parser.add_argument("--subset-l1000-mcf7", type=int, help="Number of L1000_MCF7 tasks to keep in balanced subset manifest")
+    parser.add_argument("--subset-l1000-vcap", type=int, help="Number of L1000_VCAP tasks to keep in balanced subset manifest")
     parser.add_argument("--audit-only", action="store_true", help="Only build/write task manifest and exit")
 
     # Override config options from command line
@@ -862,6 +1089,42 @@ def main():
         save_task_manifest(manifest, task_manifest_path)
         print(f"\nTask manifest written to {task_manifest_path}")
         print(summarize_manifest(manifest))
+        if args.audit_only:
+            return
+
+    if args.write_balanced_subset_manifest:
+        if not config.get("task_manifest"):
+            raise ValueError("--write-balanced-subset-manifest requires --task-manifest")
+        base_manifest = load_task_manifest(config["task_manifest"])
+        limits = {
+            "Wong_fused": int(args.subset_wong or 0),
+            "PCBA_1328": int(args.subset_pcba or 0),
+            "L1000_MCF7": int(args.subset_l1000_mcf7 or 0),
+            "L1000_VCAP": int(args.subset_l1000_vcap or 0),
+        }
+        subset_manifest = build_balanced_subset_manifest(base_manifest, limits)
+        subset_path = resolve_project_path(args.write_balanced_subset_manifest)
+        save_task_manifest(subset_manifest, subset_path)
+        print(f"\nBalanced subset manifest written to {subset_path}")
+        print(summarize_manifest(subset_manifest))
+        if args.audit_only:
+            return
+
+    if args.write_hpo_subset_manifest:
+        if not config.get("task_manifest"):
+            raise ValueError("--write-hpo-subset-manifest requires --task-manifest")
+        base_manifest = load_task_manifest(config["task_manifest"])
+        limits = {
+            "Wong_fused": int(args.subset_wong or 0),
+            "PCBA_1328": int(args.subset_pcba or 0),
+            "L1000_MCF7": int(args.subset_l1000_mcf7 or 0),
+            "L1000_VCAP": int(args.subset_l1000_vcap or 0),
+        }
+        subset_manifest = build_hpo_subset_manifest(base_manifest, limits)
+        subset_path = resolve_project_path(args.write_hpo_subset_manifest)
+        save_task_manifest(subset_manifest, subset_path)
+        print(f"\nHPO subset manifest written to {subset_path}")
+        print(summarize_manifest(subset_manifest))
         if args.audit_only:
             return
 

@@ -203,6 +203,8 @@ Phase 1 starts with a task audit artifact. Every pretraining run must be driven 
 - class counts
 - inclusion flags for HPO and Stage 2
 
+`include_in_hpo` and `include_in_stage2` are intentionally separate. Stage 1 can use a dense proxy subset, while Stage 2 still retrains on the full validated task set.
+
 The current expected family structure of `datasets/all_datasets_fused_standardized.parquet` is:
 
 - `Wong_fused`: `4` binary tasks
@@ -232,6 +234,7 @@ Stage 0 is a short smoke run on the typed-task setup. Its purpose is only to ver
 - binary and ternary losses both behave correctly
 - no negative or non-finite losses occur
 - per-family metrics are logged
+- short validation windows are rejected if they do not cover all required task groups
 - checkpoints and S3 backups work
 
 Stage 1 is the proxy HPO stage. This stage should use intermediate validation reports so ASHA can prune aggressively. It should search a slightly wider architecture space than before, while reducing freedom elsewhere:
@@ -259,6 +262,8 @@ Stage 1 should remain aggressive:
 
 - sequential single-GPU trials on a larger single node
 - aggressive ASHA pruning based on repeated intermediate validation reports
+- trial selection should use a guarded validation loss, not the raw loss, so incomplete validation coverage cannot win
+- the proxy validation slice must be large enough to cover all required groups in practice; otherwise the guarded loss should stay invalid
 - only the rank-1 configuration is promoted
 
 Stage 2 is the actual foundational training run. It should retrain the single selected configuration on the full typed-task objective until convergence, preserving:
@@ -269,6 +274,12 @@ Stage 2 is the actual foundational training run. It should retrain the single se
 - full config
 - task manifest
 - per-family metric history
+
+Initial typed config templates for this workflow now live at:
+
+- `configs/stage0_smoke_typed.json`
+- `configs/hpo_stage1_typed.json`
+- `configs/stage2_full_typed.json`
 
 ### Phase 2: MoleculeNet Benchmarking
 
