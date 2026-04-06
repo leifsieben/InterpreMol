@@ -22,5 +22,21 @@
   "hpo_grace_period": 2,
   "hpo_reduction_factor": 3,
   "trial_cpus": 4,
-  "trial_gpus": 1
+  "trial_gpus": 1,
+  "hpo_architecture_choices": [
+    {"d_model": 512, "n_layers": 6},
+    {"d_model": 384, "n_layers": 6},
+    {"d_model": 192, "n_layers": 10},
+    {"d_model": 640, "n_layers": 4},
+    {"d_model": 256, "n_layers": 10}
+  ],
+  "hpo_lr_min": 3e-5,
+  "hpo_lr_max": 4.5e-4,
+  "hpo_weight_decay_min": 1e-7,
+  "hpo_weight_decay_max": 1e-4,
+  "hpo_dropout_min": 0.06,
+  "hpo_dropout_max": 0.24,
+  "hpo_batch_size_choices": [4, 8, 16],
+  "hpo_grad_accum_choices": [1, 2, 4],
+  "hpo_max_distance_choices": [4, 6, 8, 10]
 }

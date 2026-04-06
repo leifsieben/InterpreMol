@@ -30,43 +30,20 @@ class InterpreMol(nn.Module):
 
     @classmethod
     def load(cls, path, device="cpu"):
-        state = torch.load(path, map_location=device)
+        # InterpreMol checkpoints include config/metadata objects in addition to
+        # tensor weights, so they must opt out of PyTorch 2.6's stricter
+        # weights-only default when loading trusted local artifacts.
+        state = torch.load(path, map_location=device, weights_only=False)
         config = state["config"]
+        model = cls.from_config(config)
 
-        featurizer = AtomFeaturizer(d_model=config["d_model"])
-        encoder_model = GraphTransformerEncoder(
-            n_layers=config["n_layers"],
-            d_model=config["d_model"],
-            n_heads=config["n_heads"],
-            dim_ff=config["dim_ff"],
-            dropout=config["dropout"]
-        )
-        encoder = GraphEncoder(
-            featurizer, encoder_model,
-            use_cls_token=config.get("use_cls_token", True),
-            use_edge_bias=config.get("use_edge_bias", True),
-            max_distance=config.get("max_distance", 6)
-        )
-        encoder.load_state_dict(state["encoder"], strict=False)
-
-        if config.get("task_heads"):
-            head = MultiTaskHeads(
-                input_dim=config["d_model"],
-                hidden_dim=config["mlp_hidden_dim"],
-                depth=config["mlp_head_depth"],
-                task_heads=config["task_heads"],
-            )
+        if "model_state_dict" in state:
+            model.load_state_dict(state["model_state_dict"], strict=False)
         else:
-            head = MLPHead(
-                input_dim=config["d_model"],
-                hidden_dim=config["mlp_hidden_dim"],
-                depth=config["mlp_head_depth"],
-                out_dim=config.get("out_dim", 1)
-            )
+            model.encoder.load_state_dict(state["encoder"], strict=False)
+            model.head.load_state_dict(state["head"])
 
-        head.load_state_dict(state["head"])
-
-        return cls(encoder, head, config).eval()
+        return model.eval()
 
     @classmethod
     def from_config(cls, config):
@@ -209,68 +186,71 @@ def scaled_dot_product_attention_with_bias(Q, K, V, edge_bias=None, key_padding_
 
     d_k = Q.shape[-1]
     orig_dtype = Q.dtype
+    device_type = Q.device.type
 
-    # Use contiguous FP32 tensors for attention matmuls to avoid intermittent CUBLAS
-    # invalid-value failures with strided batched GEMM on some GPU/kernel combinations.
-    Q = Q.float().contiguous()
-    K = K.float().contiguous()
-    V = V.float().contiguous()
+    # Run the attention kernel outside autocast so the explicit FP32 casts below
+    # actually stick. Without this, matmul can be silently re-autocast back to
+    # low precision and hit the same CUBLAS invalid-value failures we are
+    # trying to avoid.
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        # Use contiguous FP32 tensors for attention matmuls to avoid intermittent
+        # CUBLAS invalid-value failures with strided batched GEMM on some
+        # GPU/kernel combinations.
+        Q = Q.float().contiguous()
+        K = K.float().contiguous()
+        V = V.float().contiguous()
 
-    if Q.shape[-1] == 0:
-        raise RuntimeError(f"Invalid attention head width d_k=0 for Q shape {tuple(Q.shape)}")
-    if not torch.isfinite(Q).all() or not torch.isfinite(K).all() or not torch.isfinite(V).all():
-        raise RuntimeError(
-            "Non-finite Q/K/V before attention matmul. "
-            f"Q finite={torch.isfinite(Q).all().item()} "
-            f"K finite={torch.isfinite(K).all().item()} "
-            f"V finite={torch.isfinite(V).all().item()} "
-            f"Q shape={tuple(Q.shape)}"
-        )
-
-    # Compute attention scores: [batch, n_heads, seq, seq]
-    k_t = K.transpose(-2, -1).contiguous()
-    try:
-        scores = torch.matmul(Q, k_t)
-    except RuntimeError as exc:
-        if not _is_cublas_invalid(exc):
-            raise
-        global _ATTN_FALLBACK_WARNED
-        if not _ATTN_FALLBACK_WARNED:
-            print(
-                "[attention fallback] CUBLAS invalid in batched matmul; "
-                f"using per-head mm fallback. Q={tuple(Q.shape)} K={tuple(K.shape)}"
+        if Q.shape[-1] == 0:
+            raise RuntimeError(f"Invalid attention head width d_k=0 for Q shape {tuple(Q.shape)}")
+        if not torch.isfinite(Q).all() or not torch.isfinite(K).all() or not torch.isfinite(V).all():
+            raise RuntimeError(
+                "Non-finite Q/K/V before attention matmul. "
+                f"Q finite={torch.isfinite(Q).all().item()} "
+                f"K finite={torch.isfinite(K).all().item()} "
+                f"V finite={torch.isfinite(V).all().item()} "
+                f"Q shape={tuple(Q.shape)}"
             )
-            _ATTN_FALLBACK_WARNED = True
-        scores = _loop_batched_mm(Q, k_t)
-    scores = scores / math.sqrt(d_k)
 
-    # Add edge bias BEFORE softmax
-    if edge_bias is not None:
-        # edge_bias: [batch, seq, seq, n_heads] -> [batch, n_heads, seq, seq]
-        bias = edge_bias.permute(0, 3, 1, 2)
-        scores = scores + bias
+        # Compute attention scores: [batch, n_heads, seq, seq]
+        k_t = K.transpose(-2, -1).contiguous()
+        try:
+            scores = torch.matmul(Q, k_t)
+        except RuntimeError as exc:
+            if not _is_cublas_invalid(exc):
+                raise
+            global _ATTN_FALLBACK_WARNED
+            if not _ATTN_FALLBACK_WARNED:
+                print(
+                    "[attention fallback] CUBLAS invalid in batched matmul; "
+                    f"using per-head mm fallback. Q={tuple(Q.shape)} K={tuple(K.shape)}"
+                )
+                _ATTN_FALLBACK_WARNED = True
+            scores = _loop_batched_mm(Q, k_t)
+        scores = scores / math.sqrt(d_k)
 
-    # Apply key padding mask
-    if key_padding_mask is not None:
-        # key_padding_mask: [batch, seq] -> [batch, 1, 1, seq]
-        mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-        scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+        # Add edge bias BEFORE softmax
+        if edge_bias is not None:
+            # edge_bias: [batch, seq, seq, n_heads] -> [batch, n_heads, seq, seq]
+            bias = edge_bias.permute(0, 3, 1, 2).float()
+            scores = scores + bias
 
-    # Softmax
-    attn_weights = F.softmax(scores, dim=-1)
+        # Apply key padding mask
+        if key_padding_mask is not None:
+            # key_padding_mask: [batch, seq] -> [batch, 1, 1, seq]
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
 
-    # Dropout
-    if dropout_p > 0.0:
-        attn_weights = F.dropout(attn_weights, p=dropout_p)
+        attn_weights = F.softmax(scores, dim=-1)
+        if dropout_p > 0.0:
+            attn_weights = F.dropout(attn_weights, p=dropout_p)
 
-    # Apply to values
-    v_mat = V.contiguous()
-    try:
-        attn_output = torch.matmul(attn_weights, v_mat)
-    except RuntimeError as exc:
-        if not _is_cublas_invalid(exc):
-            raise
-        attn_output = _loop_batched_mm(attn_weights, v_mat)
+        v_mat = V.contiguous()
+        try:
+            attn_output = torch.matmul(attn_weights, v_mat)
+        except RuntimeError as exc:
+            if not _is_cublas_invalid(exc):
+                raise
+            attn_output = _loop_batched_mm(attn_weights, v_mat)
 
     return attn_output.to(orig_dtype)
 

@@ -201,6 +201,21 @@ def sanitize_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in config.items() if not str(k).startswith("_")}
 
 
+def resolve_amp_dtype(config: Dict[str, Any], device: str) -> Optional[torch.dtype]:
+    """Resolve the configured CUDA autocast dtype, if any."""
+    if not bool(config.get("use_amp", False)):
+        return None
+    if not str(device).startswith("cuda"):
+        return None
+
+    amp_dtype = str(config.get("amp_dtype", "bfloat16")).lower()
+    if amp_dtype in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if amp_dtype in {"fp16", "float16", "half"}:
+        return torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {config.get('amp_dtype')}")
+
+
 def get_required_val_groups(config: Dict[str, Any]) -> list[str]:
     """Return the task groups that must appear in validation for selection/HPO."""
     explicit = config.get("required_val_groups")
@@ -307,6 +322,7 @@ def get_default_config() -> Dict[str, Any]:
 
         # Mixed precision
         "use_amp": True,
+        "amp_dtype": "bfloat16",
 
         # Checkpointing
         "checkpoint_dir": "checkpoints",
@@ -511,7 +527,8 @@ def train_epoch(
     total_samples = 0
     processed_batches = 0
     grad_accum_steps = max(1, int(config["grad_accum_steps"]))
-    use_amp = bool(config.get("use_amp", False) and scaler is not None and str(device).startswith("cuda"))
+    amp_dtype = resolve_amp_dtype(config, device)
+    use_amp = amp_dtype is not None
     max_oom_skips = int(config.get("max_oom_skips_per_epoch", 20))
     accum_counter = 0
     skipped_no_label = 0
@@ -551,12 +568,14 @@ def train_epoch(
 
         try:
             if use_amp:
-                with torch.amp.autocast("cuda", enabled=True):
+                with torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype):
                     preds = model(mols)
                     loss = criterion(preds, labels, masks)
                     loss = loss / grad_accum_steps
-
-                scaler.scale(loss).backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
             else:
                 preds = model(mols)
                 loss = criterion(preds, labels, masks)
@@ -640,6 +659,7 @@ def validate(
     skipped_no_label = 0
     group_loss_sums: Dict[str, float] = {}
     group_valid_counts: Dict[str, int] = {}
+    amp_dtype = resolve_amp_dtype(config, device)
 
     for batch_idx, (mols, labels, masks) in enumerate(tqdm(val_loader, desc="Validating")):
         if max_val_batches is not None and processed_batches >= int(max_val_batches):
@@ -652,8 +672,8 @@ def validate(
             skipped_no_label += 1
             continue
 
-        if config["use_amp"] and str(device).startswith("cuda"):
-            with torch.amp.autocast("cuda", enabled=True):
+        if amp_dtype is not None:
+            with torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype):
                 preds = model(mols)
                 loss = criterion(preds, labels, masks)
         else:
@@ -740,7 +760,8 @@ def train(config: Dict, resume_path: Optional[str] = None) -> Dict:
         raise ValueError(f"Unknown loss: {config['loss']}")
 
     # Setup AMP
-    scaler = GradScaler("cuda") if config["use_amp"] and str(device).startswith("cuda") else None
+    amp_dtype = resolve_amp_dtype(config, device)
+    scaler = GradScaler("cuda") if amp_dtype == torch.float16 else None
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -897,8 +918,9 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
     from ray import tune
     from ray.tune.schedulers import ASHAScheduler
 
-    # Define search space
-    architecture_choices = [
+    # Define search space. Allow config overrides so second-pass HPO can widen
+    # or refine the net without changing code again.
+    architecture_choices = config.get("hpo_architecture_choices") or [
         {"d_model": 192, "n_layers": 4},
         {"d_model": 192, "n_layers": 6},
         {"d_model": 192, "n_layers": 8},
@@ -911,20 +933,29 @@ def hyperopt(config: Dict, num_samples: int = 30) -> Dict:
         {"d_model": 512, "n_layers": 4},
         {"d_model": 512, "n_layers": 6},
     ]
+    lr_min = float(config.get("hpo_lr_min", 3e-5))
+    lr_max = float(config.get("hpo_lr_max", 3e-4))
+    wd_min = float(config.get("hpo_weight_decay_min", 1e-6))
+    wd_max = float(config.get("hpo_weight_decay_max", 3e-4))
+    dropout_min = float(config.get("hpo_dropout_min", 0.05))
+    dropout_max = float(config.get("hpo_dropout_max", 0.20))
+    batch_size_choices = list(config.get("hpo_batch_size_choices", [4, 8, 16]))
+    grad_accum_choices = list(config.get("hpo_grad_accum_choices", [1, 2, 4]))
+    max_distance_choices = list(config.get("hpo_max_distance_choices", [4, 6, 8]))
     search_space = {
         **config,
         # Keep trials within a stable region for single A10G GPUs.
         "use_amp": config.get("use_amp", True),
         "architecture": tune.choice(architecture_choices),
-        "lr": tune.loguniform(3e-5, 3e-4),
-        "weight_decay": tune.loguniform(1e-6, 3e-4),
-        "batch_size": tune.choice([4, 8, 16]),
-        "grad_accum_steps": tune.choice([1, 2, 4]),
+        "lr": tune.loguniform(lr_min, lr_max),
+        "weight_decay": tune.loguniform(wd_min, wd_max),
+        "batch_size": tune.choice(batch_size_choices),
+        "grad_accum_steps": tune.choice(grad_accum_choices),
         "n_heads": 8,
-        "dropout": tune.uniform(0.05, 0.20),
+        "dropout": tune.uniform(dropout_min, dropout_max),
         "mlp_head_depth": 2,
         "use_edge_bias": True,
-        "max_distance": tune.choice([4, 6, 8]),
+        "max_distance": tune.choice(max_distance_choices),
     }
 
     def trainable(trial_config):

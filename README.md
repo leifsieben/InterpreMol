@@ -281,6 +281,239 @@ Initial typed config templates for this workflow now live at:
 - `configs/hpo_stage1_typed.json`
 - `configs/stage2_full_typed.json`
 
+### Phase 1 Execution Record
+
+The following items have actually been executed and should be treated as the current authoritative Phase 1 methodology record.
+
+#### Task audit and manifest design
+
+The fused supervised table is now handled through an explicit task manifest rather than by taking every non-SMILES column with one loss. The manifest split currently in use is:
+
+- full Stage 2 task set: `3288` tasks
+- binary tasks: `1332`
+- multiclass tasks: `1956`
+- family counts:
+  - `Wong_fused`: `4`
+  - `PCBA_1328`: `1328`
+  - `L1000`: `1956`
+
+The Stage 1 HPO proxy subset is drawn from the same fused table but uses only the tasks marked `include_in_hpo`:
+
+- HPO proxy task set: `196` tasks
+- binary tasks: `68`
+- multiclass tasks: `128`
+- family counts:
+  - `Wong_fused`: `4`
+  - `PCBA_1328`: `64`
+  - `L1000`: `128`
+
+This means the HPO runs train on the full fused dataset file, but optimize a typed proxy objective over a balanced task subset rather than all `3288` tasks directly.
+
+#### Stage 0 smoke validation
+
+Before HPO, the typed-task stack was smoke-tested locally and on the GPU node. These checks established:
+
+- mixed binary + multiclass training runs end to end
+- guarded validation rejects short windows that do not cover all required groups
+- per-group train and validation losses are logged
+- the old AMP configuration is unstable on the current A10G stack
+- the operationally robust configuration on the current node is full precision with `use_amp = false`
+
+This is why all later authoritative HPO runs use `use_amp = false`.
+
+#### Stage 1 HPO round 1
+
+Run:
+
+- `hpo_stage1_typed_fp32_20260329_175407`
+
+Configuration:
+
+- `16` Ray Tune trials
+- typed proxy objective over the `196`-task HPO subset
+- architecture space:
+  - `192 x {4,6,8}`
+  - `256 x {4,6,8}`
+  - `384 x {4,6,8}`
+  - `512 x {4,6}`
+- searched continuous/discrete knobs:
+  - `lr`
+  - `weight_decay`
+  - `dropout`
+  - `batch_size`
+  - `grad_accum_steps`
+  - `max_distance`
+- ASHA pruning with intermediate validation reports
+- guarded validation loss used as the selection metric
+
+Observed behavior:
+
+- all `16` trials completed successfully
+- all `16` trials achieved full validation coverage
+- all `16` trials showed large validation improvement from their first report
+- best trial:
+  - architecture: `512 x 6`
+  - best validation loss: `0.4440`
+- next best trials:
+  - `384 x 6`: `0.4809`
+  - `384 x 6`: `0.4851`
+  - `256 x 8`: `0.5017`
+
+Conclusion from round 1:
+
+- the typed HPO pipeline is valid
+- the proxy objective carries real learning signal
+- strong candidates are concentrated in medium-to-large models, especially `512 x 6` and `384 x 6`
+
+#### Stage 1 HPO round 2
+
+Run:
+
+- `hpo_stage1_typed_round2_20260330_115444`
+
+Purpose:
+
+- cast a wider architectural net without changing the typed proxy objective
+
+Configuration:
+
+- `32` Ray Tune trials
+- same `196`-task typed HPO subset
+- widened architecture space:
+  - `128 x 4`
+  - `128 x 6`
+  - `192 x 10`
+  - `256 x 10`
+  - `384 x 10`
+  - `512 x 8`
+  - `640 x 4`
+  - `640 x 6`
+- widened ranges:
+  - `lr: 2e-5 .. 5e-4`
+  - `weight_decay: 1e-7 .. 5e-4`
+  - `dropout: 0.03 .. 0.25`
+  - `max_distance: {4,6,8,10}`
+
+Observed behavior:
+
+- all `32` trials completed successfully
+- the widened space found additional viable regions
+- best trial:
+  - architecture: `192 x 10`
+  - best validation loss: `0.4620`
+- second best:
+  - `640 x 4`: `0.4626`
+- additional viable regions included:
+  - `128 x 4`
+  - `256 x 10`
+  - `640 x 6`
+
+Conclusion from round 2:
+
+- the wider search discovered multiple new competitive regions
+- however, round 2 did not beat the round 1 winner `512 x 6` with `0.4440`
+- several new corners were clearly weak and mainly consumed budget
+
+#### Phase 1 decision after rounds 1 and 2
+
+The correct next move is not to widen the architecture net again. The broad search objective has already been achieved. A further pass should be a refinement pass around the empirically strong architecture families:
+
+- `512 x 6`
+- `384 x 6`
+- `192 x 10`
+- `640 x 4`
+- optionally `256 x 10`
+
+The next HPO pass should therefore keep the same typed proxy objective and refine:
+
+- `lr`
+- `weight_decay`
+- `dropout`
+- `max_distance`
+- `batch_size`
+- `grad_accum_steps`
+
+The purpose of that refinement pass is to select a single final configuration for Stage 2 full-task pretraining on all `3288` tasks.
+
+#### Stage 1 HPO round 3 refinement
+
+Run:
+
+- `hpo_stage1_typed_round3_refine_20260330_171107`
+
+Purpose:
+
+- refine around the empirically strong architecture families from rounds 1 and 2 rather than widening the net again
+
+Configuration:
+
+- `64` Ray Tune trials
+- same `196`-task typed HPO subset
+- refinement architecture space:
+  - `512 x 6`
+  - `384 x 6`
+  - `192 x 10`
+  - `640 x 4`
+  - `256 x 10`
+- refined ranges:
+  - `lr: 3e-5 .. 4.5e-4`
+  - `weight_decay: 1e-7 .. 1e-4`
+  - `dropout: 0.06 .. 0.24`
+  - `max_distance: {4,6,8,10}`
+
+Observed behavior:
+
+- all `64` trials completed successfully
+- round 3 improved on rounds 2 in the refined regions
+- best trial:
+  - architecture: `256 x 10`
+  - best validation loss: `0.4553`
+- additional top trials:
+  - `192 x 10`: `0.4521`
+  - `256 x 10`: `0.4556`
+  - `384 x 6`: `0.4570`
+
+Conclusion from round 3:
+
+- the refinement pass strengthened the case for the `192 x 10`, `256 x 10`, and `384 x 6` families
+- however, it still did not beat the original round 1 winner `512 x 6`
+
+#### Global HPO selection across all Stage 1 passes
+
+The global best configuration over all completed HPO passes remains the round 1 winner:
+
+- source run: `hpo_stage1_typed_fp32_20260329_175407`
+- architecture: `512 x 6`
+- best validation loss: `0.4440`
+
+This is the configuration promoted into Stage 2.
+
+#### Stage 2 full-task foundational pretraining
+
+The first Stage 2 launch on April 1, 2026 was stopped immediately because it accidentally overrode some winning HPO optimization settings and therefore was not a strict promotion of the selected configuration.
+
+The authoritative Stage 2 run is:
+
+- `stage2_full_exactwinner_20260401_185331`
+
+This launch uses:
+
+- the exact global-best Stage 1 HPO architecture and optimization hyperparameters
+- only the Stage 2 budget changes:
+  - `task_manifest_include_flag = include_in_stage2`
+  - `epochs = 40`
+  - `warmup_epochs = 5`
+  - `early_stopping_patience = 8`
+  - `keep_last_n = 5`
+
+The run trains on all validated tasks from the fused supervised table:
+
+- `3288` total tasks
+- `1332` binary tasks
+- `1956` multiclass tasks
+
+This is the current foundational encoder training run that should be monitored and preserved.
+
 ### Phase 2: MoleculeNet Benchmarking
 
 Phase 2 starts only after Phase 1 produces a valid finalized foundational checkpoint. The benchmark should then compare:

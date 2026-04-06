@@ -62,6 +62,37 @@ else:
     summary["heartbeat"] = None
     summary["heartbeat_age_sec"] = None
 
+try:
+    pgrep_out = subprocess.check_output(
+        ["pgrep", "-af", f"pretrain.py --config {run_dir / 'config.json'}"],
+        text=True,
+    ).strip()
+    live_process_lines = [line for line in pgrep_out.splitlines() if line.strip()]
+except subprocess.CalledProcessError:
+    live_process_lines = []
+summary["live_process_count"] = len(live_process_lines)
+
+try:
+    gpu_csv = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).strip().splitlines()
+    if gpu_csv:
+        util, mem_used, mem_total = [part.strip() for part in gpu_csv[0].split(",")]
+        summary["live_gpu"] = {
+            "gpu_util_pct": int(util),
+            "gpu_mem_used_mib": int(mem_used),
+            "gpu_mem_total_mib": int(mem_total),
+        }
+    else:
+        summary["live_gpu"] = None
+except Exception:
+    summary["live_gpu"] = None
+
 config_path = run_dir / "config.json"
 summary["config"] = json.load(open(config_path)) if config_path.exists() else {}
 
@@ -200,8 +231,9 @@ def format_duration(seconds: float | None) -> str:
 def format_status(summary: dict[str, Any]) -> str:
     hb_age = summary.get("heartbeat_age_sec")
     heartbeat = summary.get("heartbeat") or {}
+    live_gpu = summary.get("live_gpu") or {}
     alive = hb_age is not None and hb_age < 180
-    working = heartbeat.get("python_pretrain_processes", 0) > 0
+    working = summary.get("live_process_count", 0) > 0
     phase = summary.get("phase", "unknown")
     status = summary.get("status", "unknown")
 
@@ -215,12 +247,13 @@ def format_status(summary: dict[str, Any]) -> str:
         f"Status: {status}",
     ]
 
-    if heartbeat:
+    if live_gpu:
         lines.append(
             "GPU: "
-            f"{heartbeat.get('gpu_util_pct', '?')}% util, "
-            f"{heartbeat.get('gpu_mem_used_mib', '?')}/{heartbeat.get('gpu_mem_total_mib', '?')} MiB"
+            f"{live_gpu.get('gpu_util_pct', '?')}% util, "
+            f"{live_gpu.get('gpu_mem_used_mib', '?')}/{live_gpu.get('gpu_mem_total_mib', '?')} MiB"
         )
+    lines.append(f"Live pretrain processes: {summary.get('live_process_count', 0)}")
 
     if phase == "hpo":
         hpo = summary.get("hpo", {})
